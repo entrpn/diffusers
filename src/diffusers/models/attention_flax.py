@@ -19,6 +19,40 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 
+class FlaxLoRALinearLayer(nn.Module):
+    r"""LoRA"""
+    in_features: int
+    out_features: int
+    rank: int = 0
+    network_alpha: float = None
+    dtype: jnp.dtype = jnp.float32
+
+    def setup(self):
+
+        if self.rank > min(self.in_features, self.out_features):
+            raise ValueError(f"LoRA rank {self.rank} must be less or equal to {min(self.in_features, self.out_features)}")
+
+        self.lora_down = nn.Dense(
+            features=self.rank,
+            use_bias=False,
+            kernel_init=nn.initializers.normal(stddev=1.0/self.rank),
+            dtype=self.dtype,
+            name="down")
+        self.lora_up = nn.Dense(
+            features=self.out_features,
+            use_bias=False,
+            kernel_init=nn.initializers.zeros_init(),
+            dtype=self.dtype,
+            name="up")
+
+    def __call__(self, hidden_states, scale):
+        down_hidden_states = self.lora_down(hidden_states)
+        up_hidden_states = self.lora_up(down_hidden_states)
+
+        if self.network_alpha is not None:
+            up_hidden_states *= self.network_alpha / self.rank
+        
+        return up_hidden_states * scale
 
 def _query_chunk_attention(query, key, value, precision, key_chunk_size: int = 4096):
     """Multi-head dot product attention with a limited number of queries."""
@@ -144,6 +178,8 @@ class FlaxAttention(nn.Module):
     dropout: float = 0.0
     use_memory_efficient_attention: bool = False
     split_head_dim: bool = False
+    lora_rank: int = 0
+    lora_network_alpha: float = None
     dtype: jnp.dtype = jnp.float32
 
     def setup(self):
@@ -157,6 +193,12 @@ class FlaxAttention(nn.Module):
 
         self.proj_attn = nn.Dense(self.query_dim, dtype=self.dtype, name="to_out_0")
         self.dropout_layer = nn.Dropout(rate=self.dropout)
+
+        if self.lora_rank > 0:
+            self.to_q_lora = FlaxLoRALinearLayer(inner_dim, inner_dim, self.lora_rank, self.lora_network_alpha)
+            self.to_k_lora = FlaxLoRALinearLayer(inner_dim, inner_dim, self.lora_rank, self.lora_network_alpha)
+            self.to_v_lora = FlaxLoRALinearLayer(inner_dim, inner_dim, self.lora_rank, self.lora_network_alpha)
+            self.to_out_lora = FlaxLoRALinearLayer(inner_dim, inner_dim, self.lora_rank, self.lora_network_alpha)
 
     def reshape_heads_to_batch_dim(self, tensor):
         batch_size, seq_len, dim = tensor.shape
@@ -174,12 +216,17 @@ class FlaxAttention(nn.Module):
         tensor = tensor.reshape(batch_size // head_size, seq_len, dim * head_size)
         return tensor
 
-    def __call__(self, hidden_states, context=None, deterministic=True):
+    def __call__(self, hidden_states, context=None, deterministic=True, scale: float=0.0):
         context = hidden_states if context is None else context
 
         query_proj = self.query(hidden_states)
         key_proj = self.key(context)
         value_proj = self.value(context)
+
+        if self.lora_rank > 0:
+            query_proj = query_proj + self.to_q_lora(hidden_states, scale)
+            key_proj = key_proj + self.to_k_lora(context, scale)
+            value_proj = value_proj + self.to_v_lora(context, scale)
 
         if self.split_head_dim:
             b = hidden_states.shape[0]
@@ -233,7 +280,7 @@ class FlaxAttention(nn.Module):
                 hidden_states = jnp.einsum("b i j, b j d -> b i d", attention_probs, value_states)
                 hidden_states = self.reshape_batch_dim_to_heads(hidden_states)
 
-        hidden_states = self.proj_attn(hidden_states)
+        hidden_states = self.proj_attn(hidden_states) + 0 if self.lora_rank <=0 else self.to_out_lora(hidden_states, scale)
         return self.dropout_layer(hidden_states, deterministic=deterministic)
 
 
@@ -261,6 +308,10 @@ class FlaxBasicTransformerBlock(nn.Module):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
     """
     dim: int
     n_heads: int
@@ -270,6 +321,8 @@ class FlaxBasicTransformerBlock(nn.Module):
     dtype: jnp.dtype = jnp.float32
     use_memory_efficient_attention: bool = False
     split_head_dim: bool = False
+    lora_rank: int = 0
+    lora_network_alpha: float = None
 
     def setup(self):
         # self attention (or cross_attention if only_cross_attention is True)
@@ -280,6 +333,8 @@ class FlaxBasicTransformerBlock(nn.Module):
             self.dropout,
             self.use_memory_efficient_attention,
             self.split_head_dim,
+            self.lora_rank,
+            self.lora_network_alpha,
             dtype=self.dtype,
         )
         # cross attention
@@ -290,6 +345,8 @@ class FlaxBasicTransformerBlock(nn.Module):
             self.dropout,
             self.use_memory_efficient_attention,
             self.split_head_dim,
+            self.lora_rank,
+            self.lora_network_alpha,
             dtype=self.dtype,
         )
         self.ff = FlaxFeedForward(dim=self.dim, dropout=self.dropout, dtype=self.dtype)
@@ -346,6 +403,10 @@ class FlaxTransformer2DModel(nn.Module):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
     """
     in_channels: int
     n_heads: int
@@ -357,6 +418,8 @@ class FlaxTransformer2DModel(nn.Module):
     dtype: jnp.dtype = jnp.float32
     use_memory_efficient_attention: bool = False
     split_head_dim: bool = False
+    lora_rank: int = 0
+    lora_network_alpha: float = None
 
     def setup(self):
         self.norm = nn.GroupNorm(num_groups=32, epsilon=1e-5)
@@ -383,6 +446,8 @@ class FlaxTransformer2DModel(nn.Module):
                 dtype=self.dtype,
                 use_memory_efficient_attention=self.use_memory_efficient_attention,
                 split_head_dim=self.split_head_dim,
+                lora_rank=self.lora_rank,
+                lora_network_alpha=self.lora_network_alpha
             )
             for _ in range(self.depth)
         ]

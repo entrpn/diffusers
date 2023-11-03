@@ -95,6 +95,10 @@ class FlaxUNet2DConditionModel(nn.Module, FlaxModelMixin, ConfigMixin):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
     """
 
     sample_size: int = 32
@@ -125,6 +129,8 @@ class FlaxUNet2DConditionModel(nn.Module, FlaxModelMixin, ConfigMixin):
     addition_time_embed_dim: Optional[int] = None
     addition_embed_type_num_heads: int = 64
     projection_class_embeddings_input_dim: Optional[int] = None
+    lora_rank: Optional[int] = 0
+    lora_network_alpha: Optional[float] = None
 
     def init_weights(self, rng: jax.Array) -> FrozenDict:
         # init input tensors
@@ -236,6 +242,8 @@ class FlaxUNet2DConditionModel(nn.Module, FlaxModelMixin, ConfigMixin):
                     only_cross_attention=only_cross_attention[i],
                     use_memory_efficient_attention=self.use_memory_efficient_attention,
                     split_head_dim=self.split_head_dim,
+                    lora_rank=self.lora_rank,
+                    lora_network_alpha=self.lora_network_alpha,
                     dtype=self.dtype,
                 )
             else:
@@ -260,6 +268,8 @@ class FlaxUNet2DConditionModel(nn.Module, FlaxModelMixin, ConfigMixin):
             use_linear_projection=self.use_linear_projection,
             use_memory_efficient_attention=self.use_memory_efficient_attention,
             split_head_dim=self.split_head_dim,
+            lora_rank=self.lora_rank,
+            lora_network_alpha=self.lora_network_alpha,
             dtype=self.dtype,
         )
 
@@ -291,6 +301,8 @@ class FlaxUNet2DConditionModel(nn.Module, FlaxModelMixin, ConfigMixin):
                     only_cross_attention=only_cross_attention[i],
                     use_memory_efficient_attention=self.use_memory_efficient_attention,
                     split_head_dim=self.split_head_dim,
+                    lora_rank=self.lora_rank,
+                    lora_network_alpha=self.lora_network_alpha,
                     dtype=self.dtype,
                 )
             else:

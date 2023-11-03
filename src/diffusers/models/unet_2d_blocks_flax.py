@@ -42,6 +42,10 @@ class FlaxCrossAttnDownBlock2D(nn.Module):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
@@ -57,6 +61,8 @@ class FlaxCrossAttnDownBlock2D(nn.Module):
     split_head_dim: bool = False
     dtype: jnp.dtype = jnp.float32
     transformer_layers_per_block: int = 1
+    lora_rank: int = 0
+    lora_network_alpha: float = None
 
     def setup(self):
         resnets = []
@@ -82,6 +88,8 @@ class FlaxCrossAttnDownBlock2D(nn.Module):
                 only_cross_attention=self.only_cross_attention,
                 use_memory_efficient_attention=self.use_memory_efficient_attention,
                 split_head_dim=self.split_head_dim,
+                lora_rank=self.lora_rank,
+                lora_network_alpha=self.lora_network_alpha,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)
@@ -187,6 +195,10 @@ class FlaxCrossAttnUpBlock2D(nn.Module):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
@@ -201,6 +213,8 @@ class FlaxCrossAttnUpBlock2D(nn.Module):
     only_cross_attention: bool = False
     use_memory_efficient_attention: bool = False
     split_head_dim: bool = False
+    lora_rank: int = 0
+    lora_network_alpha: float = None
     dtype: jnp.dtype = jnp.float32
     transformer_layers_per_block: int = 1
 
@@ -229,6 +243,8 @@ class FlaxCrossAttnUpBlock2D(nn.Module):
                 only_cross_attention=self.only_cross_attention,
                 use_memory_efficient_attention=self.use_memory_efficient_attention,
                 split_head_dim=self.split_head_dim,
+                lora_rank=self.lora_rank,
+                lora_network_alpha=self.lora_network_alpha,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)
@@ -336,6 +352,10 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
         split_head_dim (`bool`, *optional*, defaults to `False`):
             Whether to split the head dimension into a new axis for the self-attention computation. In most cases,
             enabling this flag should speed up the computation for Stable Diffusion 2.x and Stable Diffusion XL.
+        lora_rank (`int`, *optional*, defaults to 0):
+            The dimension of the LoRA update matrices.
+        lora_network_alpha(`float`, *optional*, defaults to None)
+            Equivalent to `alpha` but it's usage is specific to Kohya (A1111) style LoRAs.
         dtype (:obj:`jnp.dtype`, *optional*, defaults to jnp.float32):
             Parameters `dtype`
     """
@@ -346,6 +366,8 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
     use_linear_projection: bool = False
     use_memory_efficient_attention: bool = False
     split_head_dim: bool = False
+    lora_rank: int = 0
+    lora_network_alpha: float = None
     dtype: jnp.dtype = jnp.float32
     transformer_layers_per_block: int = 1
 
@@ -371,6 +393,8 @@ class FlaxUNetMidBlock2DCrossAttn(nn.Module):
                 use_linear_projection=self.use_linear_projection,
                 use_memory_efficient_attention=self.use_memory_efficient_attention,
                 split_head_dim=self.split_head_dim,
+                lora_rank=self.lora_rank,
+                lora_network_alpha=self.lora_network_alpha,
                 dtype=self.dtype,
             )
             attentions.append(attn_block)
