@@ -17,6 +17,7 @@ import re
 
 import jax.numpy as jnp
 from flax.traverse_util import flatten_dict, unflatten_dict
+from flax.core.frozen_dict import unfreeze, freeze
 from jax.random import PRNGKey
 
 from ..utils import logging
@@ -107,7 +108,6 @@ def rename_key_and_reshape_tensor(pt_tuple_key, pt_tensor, random_flax_state_dic
     return pt_tuple_key, pt_tensor
 
 def create_flax_params_from_pytorch_state(pt_state_dict, flax_state_dict, is_lora=False):
-    new_flax_state_dict = {}
     rank = None
     # Need to change some parameters name to match Flax names
     for pt_key, pt_tensor in pt_state_dict.items():
@@ -135,18 +135,18 @@ def create_flax_params_from_pytorch_state(pt_state_dict, flax_state_dict, is_lor
                 )
 
         # also add unexpected weight so that warning is thrown
-        new_flax_state_dict[flax_key] = jnp.asarray(flax_tensor)
+        flax_state_dict[flax_key] = jnp.asarray(flax_tensor)
     
-    return new_flax_state_dict, rank
+    return flax_state_dict, rank
 
 def convert_lora_pytorch_state_dict_to_flax(pt_state_dict, unet_params):
     # Step 1: Convert pytorch tensor to numpy
     pt_state_dict = {k: v.numpy() for k, v in pt_state_dict.items()}
 
-    unet_params = flatten_dict(unet_params)
+    unet_params = flatten_dict(unfreeze(unet_params))
     flax_state_dict, rank = create_flax_params_from_pytorch_state(pt_state_dict, unet_params,is_lora=True)
 
-    return unflatten_dict(flax_state_dict), rank
+    return freeze(unflatten_dict(flax_state_dict)), rank
 
 
 def convert_pytorch_state_dict_to_flax(pt_state_dict, flax_model, init_key=42):
