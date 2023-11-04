@@ -99,6 +99,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         return_dict: bool = True,
         output_type: str = None,
         jit: bool = False,
+        lora_scale: float = None,
     ):
         # 0. Default height and width to unet
         height = height or self.unet.config.sample_size * self.vae_scale_factor
@@ -124,6 +125,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 latents,
                 neg_prompt_ids,
                 return_latents,
+                lora_scale
             )
         else:
             images = self._generate(
@@ -137,6 +139,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 latents,
                 neg_prompt_ids,
                 return_latents,
+                lora_scale
             )
 
         if not return_dict:
@@ -178,6 +181,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
         latents: Optional[jnp.array] = None,
         neg_prompt_ids: Optional[jnp.array] = None,
         return_latents=False,
+        lora_scale=None
     ):
         if height % 8 != 0 or width % 8 != 0:
             raise ValueError(f"`height` and `width` have to be divisible by 8 but are {height} and {width}.")
@@ -240,6 +244,9 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
 
             latents_input = self.scheduler.scale_model_input(scheduler_state, latents_input, t)
 
+            cross_attention_kwargs = {}
+            if lora_scale:
+                cross_attention_kwargs["scale"] = lora_scale
             # predict the noise residual
             noise_pred = self.unet.apply(
                 {"params": params["unet"]},
@@ -247,6 +254,7 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
                 jnp.array(timestep, dtype=jnp.int32),
                 encoder_hidden_states=prompt_embeds,
                 added_cond_kwargs=added_cond_kwargs,
+                cross_attention_kwargs=cross_attention_kwargs
             ).sample
             # perform guidance
             noise_pred_uncond, noise_prediction_text = jnp.split(noise_pred, 2, axis=0)
@@ -278,8 +286,8 @@ class FlaxStableDiffusionXLPipeline(FlaxDiffusionPipeline):
 # Non-static args are (sharded) input tensors mapped over their first dimension (hence, `0`).
 @partial(
     jax.pmap,
-    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, None),
-    static_broadcasted_argnums=(0, 4, 5, 6, 10),
+    in_axes=(None, 0, 0, 0, None, None, None, 0, 0, 0, None, None),
+    static_broadcasted_argnums=(0, 4, 5, 6, 10, 11),
 )
 def _p_generate(
     pipe,
@@ -293,6 +301,7 @@ def _p_generate(
     latents,
     neg_prompt_ids,
     return_latents,
+    lora_scale
 ):
     return pipe._generate(
         prompt_ids,
@@ -305,4 +314,5 @@ def _p_generate(
         latents,
         neg_prompt_ids,
         return_latents,
+        lora_scale
     )

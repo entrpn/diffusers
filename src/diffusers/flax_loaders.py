@@ -25,7 +25,7 @@ class FlaxLoraLoaderMixin:
     r"""
     Load LoRA layers into ['FlaxUNet2DConditionModel`]
     """
-    
+
     @classmethod
     def load_lora_into_unet(
         cls,
