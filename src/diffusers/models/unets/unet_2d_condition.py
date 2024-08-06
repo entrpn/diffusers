@@ -915,9 +915,9 @@ class UNet2DConditionModel(
             # This would be a good case for the `match` statement (Python 3.10+)
             is_mps = sample.device.type == "mps"
             if isinstance(timestep, float):
-                dtype = torch.float32 if is_mps else torch.float64
+                dtype = torch.bfloat16#torch.float32 if is_mps else torch.float64
             else:
-                dtype = torch.int32 if is_mps else torch.int64
+                dtype = torch.bfloat16 #torch.int32 if is_mps else torch.int64
             timesteps = torch.tensor([timesteps], dtype=dtype, device=sample.device)
         elif len(timesteps.shape) == 0:
             timesteps = timesteps[None].to(sample.device)
