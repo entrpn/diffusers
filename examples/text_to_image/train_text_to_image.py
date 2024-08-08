@@ -62,75 +62,110 @@ DATASET_NAME_MAPPING = {
     "lambdalabs/naruto-blip-captions": ("image", "text"),
 }
 
-def train_update(step, loss, step_time):
-    print(f'step: {step}, loss: {loss}, step_step_time: {step_time}')
+class TrainSD():
 
-def step_fn(
-    batch,
-    vae,
-    device,
-    noise_scheduler,
-    weight_dtype,
-    text_encoder, 
-    unet,
-    optimizer,
-    step
-    ):
-    latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-    latents = latents * vae.config.scaling_factor
-    noise = torch.randn_like(latents).to(device, dtype=weight_dtype)
-    bsz = latents.shape[0]
-    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-    timesteps = timesteps.long()
+    def __init__(self, first_epoch, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, data_loader, args):
+        self.first_epoch = first_epoch
+        self.vae = vae
+        self.weight_dtype = weight_dtype
+        self.device = device
+        self.noise_scheduler = noise_scheduler
+        self.unet = unet
+        self.optimizer = optimizer
+        self.text_encoder = text_encoder
+        self.data_loader = data_loader
+        self.args = args
 
-    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        self.compiled_step_fn = torch_xla.experimental.compile(
+            self.step_fn
+        )
+        self.global_step = 0
 
-    encoder_hidden_states = text_encoder(batch["input_ids"], return_dict=False)[0]
+    def run_optimizer(self):
+        self.optimizer.step()
     
-    if args.prediction_type is not None:
-        # set prediction_type of scheduler if defined
-        noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-
-    if noise_scheduler.config.prediction_type == "epsilon":
-        target = noise
-    elif noise_scheduler.config.prediction_type == "v_prediction":
-        target = noise_scheduler.get_velocity(latents, noise, timesteps)
-    else:
-        raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-    if args.snr_gamma is None:
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-    else:
-        # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-        # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-        # This is discussed in Section 4.2 of the same paper.
-        snr = compute_snr(noise_scheduler, timesteps)
-        mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-            dim=1
-        )[0]
-        if noise_scheduler.config.prediction_type == "epsilon":
-            mse_loss_weights = mse_loss_weights / snr
-        elif noise_scheduler.config.prediction_type == "v_prediction":
-            mse_loss_weights = mse_loss_weights / (snr + 1)
-
-        loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-        loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-        loss = loss.mean()
+    def train_loop_fn(self, train_dataloader, epoch):
+        last_time = time.time()
+        for step, batch in enumerate(train_dataloader):
+            loss = self.compiled_step_fn(batch["pixel_values"],batch["input_ids"])
+            # if step % 10 == 0:
+            #     xm.add_step_closure(
+            #         self.train_update, args=(step, loss, (time.time() - last_time))
+            #     )
+            print(f'step: {step}, step_step_time: {time.time() - last_time}')
+            last_time = time.time()
+            self.global_step += 1
+            if self.global_step >= self.args.max_train_steps:
+                break
     
-    avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(args.train_batch_size)).mean()
-    train_loss += avg_loss.item() / args.gradient_accumulation_steps
-    loss.backward()
-    optimizer.step()
-    optimizer.zero_grad()
+    def start_training(self):
+        for epoch in range(self.first_epoch, self.args.num_train_epochs):
+            xm.master_print('Epoch {} train begin {}'.format(
+                epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
+            self.train_loop_fn(self.data_loader, epoch)
+        #xm.wait_device_ops()
+            
 
-    #xm.optimizer_step(optimizer, barrier=True)
+    def train_update(self, step, loss, step_time):
+        print(f'step: {step}, loss: {loss}, step_step_time: {step_time}')
 
-    if xm.is_master_ordinal():
-        print(f"step {step}, time: {(time.time() - last_time)}")
-    last_time = time.time()
-    xm.mark_step()
+    def step_fn(
+        self,
+        pixel_values,
+        input_ids
+        ):
+
+        self.optimizer.zero_grad()
+
+        latents = self.vae.encode(pixel_values.to(self.weight_dtype)).latent_dist.sample()
+        latents = latents * self.vae.config.scaling_factor
+        noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
+        bsz = latents.shape[0]
+        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+        timesteps = timesteps.long()
+
+        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+
+        encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+        
+        if self.args.prediction_type is not None:
+            # set prediction_type of scheduler if defined
+            self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+
+        if self.noise_scheduler.config.prediction_type == "epsilon":
+            target = noise
+        elif self.noise_scheduler.config.prediction_type == "v_prediction":
+            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        else:
+            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+
+        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+
+        if self.args.snr_gamma is None:
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        else:
+            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+            # This is discussed in Section 4.2 of the same paper.
+            snr = compute_snr(self.noise_scheduler, timesteps)
+            mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                dim=1
+            )[0]
+            if self.noise_scheduler.config.prediction_type == "epsilon":
+                mse_loss_weights = mse_loss_weights / snr
+            elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                mse_loss_weights = mse_loss_weights / (snr + 1)
+
+            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+            loss = loss.mean()
+        
+        #avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
+        #train_loss += avg_loss.item() / self.args.gradient_accumulation_steps
+        loss.backward()
+        self.run_optimizer()
+        #xm.mark_step()
+        return loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -674,9 +709,6 @@ def main(args):
     # Train!
     total_batch_size = args.train_batch_size * torch_xla.runtime.world_size() * args.gradient_accumulation_steps
 
-    compiled_step_fn = torch_xla.experimental.compile(
-        step_fn)
-
     if xm.is_master_ordinal():
         print("***** Running training *****")
         print(f"  Num examples = {len(train_dataset)}")
@@ -685,74 +717,21 @@ def main(args):
         print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
         print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         print(f"  Total optimization steps = {args.max_train_steps}")
-    global_step = 0
-    first_epoch = 0
-    for epoch in range(first_epoch, args.num_train_epochs):
-        train_loss = 0.0
-        last_time = time.time()
-        for step, batch in enumerate(train_dataloader):
-            latents = vae.encode(batch["pixel_values"].to(weight_dtype)).latent_dist.sample()
-            latents = latents * vae.config.scaling_factor
-            noise = torch.randn_like(latents).to(device, dtype=weight_dtype)
-            bsz = latents.shape[0]
-            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-            timesteps = timesteps.long()
 
-            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-            encoder_hidden_states = text_encoder_compiled(batch["input_ids"], return_dict=False)[0]
-            
-            if args.prediction_type is not None:
-                # set prediction_type of scheduler if defined
-                noise_scheduler.register_to_config(prediction_type=args.prediction_type)
-
-            if noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif noise_scheduler.config.prediction_type == "v_prediction":
-                target = noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
-
-            model_pred = unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-            if args.snr_gamma is None:
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-            else:
-                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                # This is discussed in Section 4.2 of the same paper.
-                snr = compute_snr(noise_scheduler, timesteps)
-                mse_loss_weights = torch.stack([snr, args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                    dim=1
-                )[0]
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    mse_loss_weights = mse_loss_weights / snr
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    mse_loss_weights = mse_loss_weights / (snr + 1)
-
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                loss = loss.mean()
-            
-            avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(args.train_batch_size)).mean()
-            train_loss += avg_loss.item() / args.gradient_accumulation_steps
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
-
-            #xm.optimizer_step(optimizer, barrier=True)
-            
-            if step % 10 == 0:
-                xm.add_step_closure(
-                    train_update, args=(step, loss, (time.time() - last_time))
-                )
-            last_time = time.time()
-            xm.mark_step()
-            global_step += 1
-            if global_step >= args.max_train_steps:
-                break
+    trainer = TrainSD(first_epoch=0,
+                      vae=vae_compiled,
+                      weight_dtype=weight_dtype,
+                      device=device,
+                      noise_scheduler=noise_scheduler,
+                      unet=unet_compiled,
+                      optimizer=optimizer,
+                      text_encoder=text_encoder_compiled,
+                      data_loader=train_dataloader,
+                      args=args)
+    
+    trainer.start_training()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    xmp.spawn(main, args=())
+    xmp.spawn(main,args=())
