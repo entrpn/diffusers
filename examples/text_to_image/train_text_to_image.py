@@ -17,14 +17,9 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
-from torch.utils.data import DataLoader
 import transformers
 # from accelerate import Accelerator
-from accelerate.logging import get_logger
-from accelerate.state import AcceleratorState
-from accelerate.utils import ProjectConfiguration, set_seed
 from datasets import load_dataset
-from huggingface_hub import create_repo, upload_folder
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -40,6 +35,7 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
+import torch_xla.debug.metrics as met
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_backend
@@ -53,10 +49,12 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
 
+PROFILE_DIR='/home/jfacevedo/pxla_profile/'
+
 xr.initialize_cache('/tmp/xla_cache/', readonly=False)
 
 torch_xla.experimental.eager_mode(True)
-#torch_xla.runtime.use_spmd()
+xr.use_spmd()
 
 DATASET_NAME_MAPPING = {
     "lambdalabs/naruto-blip-captions": ("image", "text"),
@@ -76,6 +74,11 @@ class TrainSD():
         self.data_loader = data_loader
         self.args = args
 
+        num_devices = xr.global_runtime_device_count()
+        device_ids = np.arange(num_devices)
+        mesh_shape = (num_devices,)
+        mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
+
         self.compiled_step_fn = torch_xla.experimental.compile(
             self.step_fn
         )
@@ -87,12 +90,21 @@ class TrainSD():
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
+            # if step == 1:
+            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
+            #with xp.StepTrace('Training_step',step_num=step):
+            #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             loss = self.compiled_step_fn(batch["pixel_values"],batch["input_ids"])
-            # if step % 10 == 0:
-            #     xm.add_step_closure(
-            #         self.train_update, args=(step, loss, (time.time() - last_time))
-            #     )
-            print(f'step: {step}, step_step_time: {time.time() - last_time}')
+            # if xm.is_master_ordinal():
+            #     if step % 10 == 0:
+            #         avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
+            #         # xm.add_step_closure(
+            #         #     self.train_update, args=(step, loss, (time.time() - last_time))
+            #         # )
+            #         print(f'step: {step}, loss : {avg_loss}, step_step_time: {time.time() - last_time}')
+            #     else:
+            xm.mark_step()
+            print(f"step: {step}, step_time: {time.time() - last_time}")
             last_time = time.time()
             self.global_step += 1
             if self.global_step >= self.args.max_train_steps:
@@ -103,7 +115,8 @@ class TrainSD():
             xm.master_print('Epoch {} train begin {}'.format(
                 epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
             self.train_loop_fn(self.data_loader, epoch)
-        #xm.wait_device_ops()
+        #print(met.metrics_report())
+        xm.wait_device_ops()
             
 
     def train_update(self, step, loss, step_time):
@@ -114,9 +127,8 @@ class TrainSD():
         pixel_values,
         input_ids
         ):
-
         self.optimizer.zero_grad()
-
+        
         latents = self.vae.encode(pixel_values.to(self.weight_dtype)).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
         noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
@@ -138,7 +150,7 @@ class TrainSD():
             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-
+        # breakpoint()
         model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
         if self.args.snr_gamma is None:
@@ -164,7 +176,6 @@ class TrainSD():
         #train_loss += avg_loss.item() / self.args.gradient_accumulation_steps
         loss.backward()
         self.run_optimizer()
-        #xm.mark_step()
         return loss
 
 def parse_args():
@@ -492,7 +503,7 @@ def setup_model_parallel() -> Tuple[int, int]:
     rank = xm.get_ordinal()
     world_size = xm.xrt_world_size()
     # torch.distributed.init_process_group("xla", rank=rank, world_size=world_size)
-    torch.distributed.init_process_group("xla", init_method="xla://")
+    #torch.distributed.init_process_group("xla", init_method="xla://")
 
     # seed must be the same in all processes
     torch.manual_seed(1)
@@ -517,10 +528,15 @@ def main(args):
     # server = xp.start_server(9012)
 
     device = xm.xla_device()
-    rank, world_size = setup_model_parallel()
+    # rank, world_size = setup_model_parallel()
 
-    print('rank, world_size', rank, world_size)
-    print("world size: ", xr.world_size())
+    # print('rank, world_size', rank, world_size)
+    # print("world size: ", xr.world_size())
+
+    num_devices = xr.global_runtime_device_count()
+    device_ids = np.arange(num_devices)
+    mesh_shape = (num_devices,)
+    mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
 
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -557,11 +573,11 @@ def main(args):
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
-    text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
+    #text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
     vae = vae.to(device, dtype=weight_dtype)
-    vae_compiled = torch.compile(vae, backend="openxla")
+    #vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
-    unet_compiled = torch.compile(unet, backend="openxla")
+    #unet_compiled = torch.compile(unet, backend="openxla")
 
      # set up dataset
 
@@ -671,20 +687,17 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    num_devices = xr.global_runtime_device_count()
-    device_ids = np.arange(num_devices)
-    mesh_shape = (num_devices,)
-    mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
-
     data_sharding = {
         "input_ids" : xs.ShardingSpec(mesh, ('batch',None)),
-        "pixel_values" : xs.ShardingSpec(mesh, ('batch',None, None, None)),                  
+        "pixel_values" : xs.ShardingSpec(mesh, ('batch',None, None, None)),
     }
 
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         device,
+        input_sharding=data_sharding
     )
+
     train_dataloader.dataset=train_dataset
 
     overrode_max_train_steps = False
@@ -707,7 +720,7 @@ def main(args):
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # Train!
-    total_batch_size = args.train_batch_size * torch_xla.runtime.world_size() * args.gradient_accumulation_steps
+    total_batch_size = args.train_batch_size * num_devices
 
     if xm.is_master_ordinal():
         print("***** Running training *****")
@@ -719,13 +732,13 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
 
     trainer = TrainSD(first_epoch=0,
-                      vae=vae_compiled,
+                      vae=vae,
                       weight_dtype=weight_dtype,
                       device=device,
                       noise_scheduler=noise_scheduler,
-                      unet=unet_compiled,
+                      unet=unet,
                       optimizer=optimizer,
-                      text_encoder=text_encoder_compiled,
+                      text_encoder=text_encoder,
                       data_loader=train_dataloader,
                       args=args)
     
@@ -734,4 +747,5 @@ def main(args):
 
 if __name__ == "__main__":
     args = parse_args()
-    xmp.spawn(main,args=())
+    main(args)
+    #xmp.spawn(main,args=())
