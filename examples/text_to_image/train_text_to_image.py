@@ -95,16 +95,16 @@ class TrainSD():
             #with xp.StepTrace('Training_step',step_num=step):
             #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             loss = self.compiled_step_fn(batch)
-            # if xm.is_master_ordinal():
-            #     if step % 10 == 0:
-            #         avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-            #         # xm.add_step_closure(
-            #         #     self.train_update, args=(step, loss, (time.time() - last_time))
-            #         # )
-            #         print(f'step: {step}, loss : {avg_loss}, step_step_time: {time.time() - last_time}')
+            if xm.is_master_ordinal():
+                if step % 10 == 0:
+                    avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
+                    xm.add_step_closure(
+                        self.train_update, args=(step, avg_loss, (time.time() - last_time))
+                    )
+                    #print(f'step: {step}, loss : {avg_loss}, step_step_time: {time.time() - last_time}')
             #     else:
             xm.mark_step()
-            print(f"step: {step}, step_time: {time.time() - last_time}")
+            #print(f"step: {step}, step_time: {time.time() - last_time}")
             last_time = time.time()
             self.global_step += 1
             if self.global_step >= self.args.max_train_steps:
@@ -739,6 +739,13 @@ def main(args):
                       args=args)
     
     trainer.start_training()
+    unet = trainer.unet.to("cpu")
+    vae = trainer.vae.to("cpu")
+    text_encoder = trainer.text_encoder.to("cpu")
+
+    pipeline = StableDiffusionPipeline.from_pretrained(args.pretrained_model_name_or_path,text_encoder=text_encoder,vae=vae,unet=unet,revision=args.revision,variant=args.variant,
+        )
+    pipeline.save_pretrained(args.output_dir)
 
 
 if __name__ == "__main__":
