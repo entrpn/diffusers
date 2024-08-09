@@ -510,6 +510,7 @@ def main(args):
     device_ids = np.arange(num_devices)
     mesh_shape = (num_devices,)
     mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
+    xs.set_global_mesh(mesh)
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
 
@@ -537,7 +538,7 @@ def main(args):
     first_epoch = 0
     profile_logdir = os.environ['PROFILE_LOGDIR']
     # Use trace_detached to capture the profile from a background thread
-    xp.trace_detached('localhost:9012', profile_logdir, duration_ms=10000)
+    # xp.trace_detached('localhost:9012', profile_logdir, duration_ms=10000)
     last_time = time.time()
     for epoch in range(first_epoch, args.num_train_epochs):
         train_loss = 0.0
