@@ -90,11 +90,11 @@ class TrainSD():
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
-            # if step == 1:
-            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
+            if step == 1:
+                xp.trace_detached('localhost:9012', PROFILE_DIR)
             #with xp.StepTrace('Training_step',step_num=step):
             #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
-            loss = self.compiled_step_fn(batch["pixel_values"],batch["input_ids"])
+            loss = self.compiled_step_fn(batch)
             # if xm.is_master_ordinal():
             #     if step % 10 == 0:
             #         avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
@@ -124,12 +124,11 @@ class TrainSD():
 
     def step_fn(
         self,
-        pixel_values,
-        input_ids
+        batch
         ):
         self.optimizer.zero_grad()
         
-        latents = self.vae.encode(pixel_values.to(self.weight_dtype)).latent_dist.sample()
+        latents = self.vae.encode(batch["pixel_values"]).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
         noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
         bsz = latents.shape[0]
@@ -138,7 +137,7 @@ class TrainSD():
 
         noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+        encoder_hidden_states = self.text_encoder(batch["input_ids"], return_dict=False)[0]
         
         if self.args.prediction_type is not None:
             # set prediction_type of scheduler if defined
@@ -525,15 +524,12 @@ def main(args):
 
     args = parse_args()
 
-    # server = xp.start_server(9012)
+    server = xp.start_server(9012)
 
     device = xm.xla_device()
-    # rank, world_size = setup_model_parallel()
-
-    # print('rank, world_size', rank, world_size)
-    # print("world size: ", xr.world_size())
 
     num_devices = xr.global_runtime_device_count()
+    args.train_batch_size = args.train_batch_size * num_devices
     device_ids = np.arange(num_devices)
     mesh_shape = (num_devices,)
     mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
@@ -634,7 +630,7 @@ def main(args):
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
-        inputs.input_ids = inputs.input_ids.to(device)
+        #inputs.input_ids = inputs.input_ids.to(device)
         return inputs.input_ids
 
     # Preprocessing the datasets.
@@ -650,7 +646,7 @@ def main(args):
 
     def preprocess_train(examples):
         images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image).to(device, dtype=weight_dtype) for image in images]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
 
@@ -665,8 +661,9 @@ def main(args):
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(weight_dtype)
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
         input_ids = torch.stack([example["input_ids"] for example in examples])
+        input_ids = input_ids.to(device)
         return {"pixel_values": pixel_values, "input_ids": input_ids}
 
     train_sampler = None
@@ -720,14 +717,13 @@ def main(args):
     args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
 
     # Train!
-    total_batch_size = args.train_batch_size * num_devices
 
     if xm.is_master_ordinal():
         print("***** Running training *****")
         print(f"  Num examples = {len(train_dataset)}")
         print(f"  Num Epochs = {args.num_train_epochs}")
-        print(f"  Instantaneous batch size per device = {args.train_batch_size}")
-        print(f"  Total train batch size (w. parallel, distributed & accumulation) = {total_batch_size}")
+        print(f"  Instantaneous batch size per device = {args.train_batch_size // num_devices}")
+        print(f"  Total train batch size (w. parallel, distributed & accumulation) = {args.train_batch_size}")
         print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         print(f"  Total optimization steps = {args.max_train_steps}")
 
