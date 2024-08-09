@@ -90,8 +90,8 @@ class TrainSD():
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
-            if step == 1:
-                xp.trace_detached('localhost:9012', PROFILE_DIR)
+            # if step == 1:
+            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
             #with xp.StepTrace('Training_step',step_num=step):
             #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             loss = self.compiled_step_fn(batch)
@@ -529,10 +529,10 @@ def main(args):
     device = xm.xla_device()
 
     num_devices = xr.global_runtime_device_count()
-    args.train_batch_size = args.train_batch_size * num_devices
+    args.train_batch_size = args.train_batch_size #* num_devices
     device_ids = np.arange(num_devices)
-    mesh_shape = (num_devices,)
-    mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
+    mesh_shape = (num_devices,1,1)
+    mesh = xs.Mesh(device_ids, mesh_shape, ('batch','fsdp', 'tensor'))
 
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -569,11 +569,11 @@ def main(args):
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
-    #text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
+    # text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
     vae = vae.to(device, dtype=weight_dtype)
-    #vae_compiled = torch.compile(vae, backend="openxla")
+    vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
-    #unet_compiled = torch.compile(unet, backend="openxla")
+    unet_compiled = torch.compile(unet, backend="openxla")
 
      # set up dataset
 
@@ -728,11 +728,11 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
 
     trainer = TrainSD(first_epoch=0,
-                      vae=vae,
+                      vae=vae_compiled,
                       weight_dtype=weight_dtype,
                       device=device,
                       noise_scheduler=noise_scheduler,
-                      unet=unet,
+                      unet=unet_compiled,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
                       data_loader=train_dataloader,
