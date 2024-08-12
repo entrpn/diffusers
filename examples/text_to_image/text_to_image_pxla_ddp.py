@@ -53,9 +53,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
 
-PROFILE_DIR='/home/jfacevedo/pxla_profile/'
+PROFILE_DIR='/home/bbahl/ddp_profile/'
 
-xr.initialize_cache('/tmp/xla_cache/', readonly=False)
+# xr.initialize_cache('/tmp/xla_cache/', readonly=False)
 
 torch_xla.experimental.eager_mode(True)
 #torch_xla.runtime.use_spmd()
@@ -66,7 +66,7 @@ DATASET_NAME_MAPPING = {
 
 class TrainSD():
 
-    def __init__(self, first_epoch, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, data_loader, args):
+    def __init__(self, first_epoch, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, data_loader, args, rank):
         self.first_epoch = first_epoch
         self.vae = vae
         self.weight_dtype = weight_dtype
@@ -77,8 +77,9 @@ class TrainSD():
         self.text_encoder = text_encoder
         self.data_loader = data_loader
         self.args = args
+        self.rank = rank
 
-        self.compiled_step_fn = torch_xla.experimental.compile(
+        self.compiled_step_fn = torch_xla.compile(
             self.step_fn
         )
         self.global_step = 0
@@ -89,8 +90,8 @@ class TrainSD():
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
-            # if step == 1:
-            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
+            if step == 2 and self.rank == 0:
+                xp.trace_detached('localhost:9012', PROFILE_DIR)
             loss = self.compiled_step_fn(batch)
             # if step % 10 == 0:
             #     xm.add_step_closure(
@@ -105,6 +106,7 @@ class TrainSD():
                 break
     
     def start_training(self):
+        
         for epoch in range(self.first_epoch, self.args.num_train_epochs):
             xm.master_print('Epoch {} train begin {}'.format(
                 epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
@@ -491,12 +493,9 @@ def parse_args():
     return args
 
 def setup_model_parallel() -> Tuple[int, int]:
-    # os.environ['MASTER_ADDR'] = 'localhost'
-    # os.environ['MASTER_PORT'] = '12355'
     # assuming model parallelism over the whole world size
     rank = xm.get_ordinal()
     world_size = xm.xrt_world_size()
-    # torch.distributed.init_process_group("xla", rank=rank, world_size=world_size)
     torch.distributed.init_process_group("xla", init_method="xla://")
 
     # seed must be the same in all processes
@@ -519,14 +518,17 @@ def main(args):
 
     args = parse_args()
 
-    server = xp.start_server(9012)
+    # server = xp.start_server(9012)
 
     device = xm.xla_device()
     rank, world_size = setup_model_parallel()
 
     print('rank, world_size', rank, world_size)
     print("world size: ", xr.world_size())
-
+    server = None
+    if rank == 0:
+        print("Starting profiler server")
+        server = xp.start_server(9012)
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
@@ -676,21 +678,10 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    num_devices = xr.global_runtime_device_count()
-    device_ids = np.arange(num_devices)
-    mesh_shape = (num_devices,)
-    mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
-
-    data_sharding = {
-        "input_ids" : xs.ShardingSpec(mesh, ('batch',None)),
-        "pixel_values" : xs.ShardingSpec(mesh, ('batch',None, None, None)),                  
-    }
-
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         device,
     )
-    train_dataloader.dataset=train_dataset
 
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -698,12 +689,12 @@ def main(args):
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * torch_xla.runtime.world_size(),
-        num_training_steps=args.max_train_steps * torch_xla.runtime.world_size(),
-    )
+    # lr_scheduler = get_scheduler(
+    #     args.lr_scheduler,
+    #     optimizer=optimizer,
+    #     num_warmup_steps=args.lr_warmup_steps * torch_xla.runtime.world_size(),
+    #     num_training_steps=args.max_train_steps * torch_xla.runtime.world_size(),
+    # )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -732,7 +723,8 @@ def main(args):
                       optimizer=optimizer,
                       text_encoder=text_encoder_compiled,
                       data_loader=train_dataloader,
-                      args=args)
+                      args=args,
+                      rank=rank)
     
     trainer.start_training()
 
