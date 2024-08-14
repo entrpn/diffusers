@@ -79,19 +79,18 @@ class TrainSD():
         self.args = args
         self.rank = rank
 
-        self.compiled_step_fn = torch_xla.compile(
-            self.step_fn
-        )
+        self.compiled_step_fn = torch_xla.experimental.compile(self.step_fn)
         self.global_step = 0
 
     def run_optimizer(self):
-        self.optimizer.step()
+        xm.optimizer_step(self.optimizer)
+        # self.optimizer.step()
     
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
             if step == 2 and self.rank == 0:
-                xp.trace_detached('localhost:9012', PROFILE_DIR)
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=4000)
             loss = self.compiled_step_fn(batch)
             # if step % 10 == 0:
             #     xm.add_step_closure(
@@ -166,9 +165,6 @@ class TrainSD():
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
-        
-        #avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-        #train_loss += avg_loss.item() / self.args.gradient_accumulation_steps
         loss.backward()
         self.run_optimizer()
         #xm.mark_step()
