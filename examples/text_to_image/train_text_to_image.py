@@ -45,13 +45,13 @@ import torch_xla.distributed.parallel_loader as pl
 import torch_xla.runtime as xr
 import torch_xla.distributed.spmd as xs
 from torch.nn.parallel import DistributedDataParallel as DDP
-
+import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
 
-PROFILE_DIR='/home/jfacevedo/pxla_profile/'
+PROFILE_DIR='/mnt/disks/bbahl/pxla_profile/'
 
-xr.initialize_cache('/tmp/xla_cache/', readonly=False)
+xr.initialize_cache('/mnt/disks/bbahl/tmp/xla_cache/', readonly=False)
 
 torch_xla.experimental.eager_mode(True)
 xr.use_spmd()
@@ -76,8 +76,7 @@ class TrainSD():
 
         num_devices = xr.global_runtime_device_count()
         device_ids = np.arange(num_devices)
-        mesh_shape = (num_devices,)
-        mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
+        self.mesh = xs.get_global_mesh()
 
         self.compiled_step_fn = torch_xla.experimental.compile(
             self.step_fn
@@ -94,17 +93,12 @@ class TrainSD():
             #     xp.trace_detached('localhost:9012', PROFILE_DIR)
             #with xp.StepTrace('Training_step',step_num=step):
             #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
+            xs.mark_sharding(batch["pixel_values"], self.mesh, ('batch', None, None, None))
+            xs.mark_sharding(batch["input_ids"], self.mesh, ('batch', None))
             loss = self.compiled_step_fn(batch)
-            if xm.is_master_ordinal():
-                if step % 10 == 0:
-                    avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-                    xm.add_step_closure(
-                        self.train_update, args=(step, avg_loss, (time.time() - last_time))
-                    )
-                    #print(f'step: {step}, loss : {avg_loss}, step_step_time: {time.time() - last_time}')
-            #     else:
             xm.mark_step()
-            #print(f"step: {step}, step_time: {time.time() - last_time}")
+            print(met.short_metrics_report())
+            print(f"step: {step}, step_time: {time.time() - last_time}")
             last_time = time.time()
             self.global_step += 1
             if self.global_step >= self.args.max_train_steps:
@@ -533,6 +527,7 @@ def main(args):
     device_ids = np.arange(num_devices)
     mesh_shape = (num_devices,1,1)
     mesh = xs.Mesh(device_ids, mesh_shape, ('batch','fsdp', 'tensor'))
+    xs.set_global_mesh(mesh)
 
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -571,9 +566,10 @@ def main(args):
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
     # text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
     vae = vae.to(device, dtype=weight_dtype)
-    vae_compiled = torch.compile(vae, backend="openxla")
+    #vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
-    unet_compiled = torch.compile(unet, backend="openxla")
+    
+    #unet_compiled = torch.compile(unet, backend="openxla")
 
      # set up dataset
 
@@ -684,18 +680,12 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    data_sharding = {
-        "input_ids" : xs.ShardingSpec(mesh, ('batch',None)),
-        "pixel_values" : xs.ShardingSpec(mesh, ('batch',None, None, None)),
-    }
-
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         device,
-        input_sharding=data_sharding
     )
 
-    train_dataloader.dataset=train_dataset
+    #train_dataloader.dataset=train_dataset
 
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -728,11 +718,11 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
 
     trainer = TrainSD(first_epoch=0,
-                      vae=vae_compiled,
+                      vae=vae,
                       weight_dtype=weight_dtype,
                       device=device,
                       noise_scheduler=noise_scheduler,
-                      unet=unet_compiled,
+                      unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
                       data_loader=train_dataloader,
@@ -751,4 +741,5 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
+    print(met.metrics_report())
     #xmp.spawn(main,args=())
