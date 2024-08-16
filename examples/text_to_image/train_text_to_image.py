@@ -35,7 +35,6 @@ from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
 
-import torch_xla.debug.metrics as met
 import torch_xla
 import torch_xla.core.xla_model as xm
 import torch_xla.distributed.xla_backend
@@ -52,18 +51,11 @@ import torch_xla.distributed.xla_backend
 PROFILE_DIR='/mnt/disks/bbahl/pxla_profile/'
 
 xr.initialize_cache('/mnt/disks/bbahl/tmp/xla_cache/', readonly=False)
-
-torch_xla.experimental.eager_mode(True)
 xr.use_spmd()
-
-DATASET_NAME_MAPPING = {
-    "lambdalabs/naruto-blip-captions": ("image", "text"),
-}
 
 class TrainSD():
 
-    def __init__(self, first_epoch, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, data_loader, args):
-        self.first_epoch = first_epoch
+    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, args):
         self.vae = vae
         self.weight_dtype = weight_dtype
         self.device = device
@@ -71,103 +63,83 @@ class TrainSD():
         self.unet = unet
         self.optimizer = optimizer
         self.text_encoder = text_encoder
-        self.data_loader = data_loader
         self.args = args
-
-        num_devices = xr.global_runtime_device_count()
-        device_ids = np.arange(num_devices)
         self.mesh = xs.get_global_mesh()
-
-        self.compiled_step_fn = torch_xla.experimental.compile(
-            self.step_fn
-        )
+        self.pixel_values = torch.randn((args.train_batch_size, 3, 512, 512), dtype=weight_dtype, device=device)
+        # Tokenizer pads all input text to a length of 77.
+        self.input_ids = torch.randint(0, 1000, (args.train_batch_size, 77), dtype=torch.int64, device=device)
+        xs.mark_sharding(self.pixel_values, self.mesh, ('x', None, None, None))
+        xs.mark_sharding(self.input_ids, self.mesh, ('x', None))
         self.global_step = 0
 
     def run_optimizer(self):
         self.optimizer.step()
-    
-    def train_loop_fn(self, train_dataloader, epoch):
+
+    def start_training(self):
+        start_time = 0
         last_time = time.time()
-        for step, batch in enumerate(train_dataloader):
-            # if step == 1:
-            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
-            #with xp.StepTrace('Training_step',step_num=step):
-            #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
-            xs.mark_sharding(batch["pixel_values"], self.mesh, ('batch', None, None, None))
-            xs.mark_sharding(batch["input_ids"], self.mesh, ('batch', None))
-            loss = self.compiled_step_fn(batch)
+        for step in range(self.args.max_train_steps):
+            if step == 2:
+                xp.trace_detached('localhost:9012', PROFILE_DIR)
+                start_time = time.time()
+            loss = self.step_fn(self.pixel_values, self.input_ids)
             xm.mark_step()
-            print(met.short_metrics_report())
             print(f"step: {step}, step_time: {time.time() - last_time}")
             last_time = time.time()
-            self.global_step += 1
-            if self.global_step >= self.args.max_train_steps:
-                break
-    
-    def start_training(self):
-        for epoch in range(self.first_epoch, self.args.num_train_epochs):
-            xm.master_print('Epoch {} train begin {}'.format(
-                epoch, time.strftime('%l:%M%p %Z on %b %d, %Y')))
-            self.train_loop_fn(self.data_loader, epoch)
-        #print(met.metrics_report())
         xm.wait_device_ops()
-            
-
-    def train_update(self, step, loss, step_time):
-        print(f'step: {step}, loss: {loss}, step_step_time: {step_time}')
+        end_time = time.time()
+        print("Average step time from step 3 onwards: ", (end_time-start_time)/(args.max_train_steps-2))
 
     def step_fn(
         self,
-        batch
+        pixel_values,
+        input_ids,
         ):
-        self.optimizer.zero_grad()
-        
-        latents = self.vae.encode(batch["pixel_values"]).latent_dist.sample()
-        latents = latents * self.vae.config.scaling_factor
-        noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
-        bsz = latents.shape[0]
-        timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-        timesteps = timesteps.long()
+        with xp.Trace("model.forward"):
+            self.optimizer.zero_grad()
+            latents = self.vae.encode(pixel_values).latent_dist.sample()
+            latents = latents * self.vae.config.scaling_factor
+            noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
+            bsz = latents.shape[0]
+            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
 
-        noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-        encoder_hidden_states = self.text_encoder(batch["input_ids"], return_dict=False)[0]
-        
-        if self.args.prediction_type is not None:
-            # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+            encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+            
+            if self.args.prediction_type is not None:
+                # set prediction_type of scheduler if defined
+                self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
 
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-        # breakpoint()
-        model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-
-        if self.args.snr_gamma is None:
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-        else:
-            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-            # This is discussed in Section 4.2 of the same paper.
-            snr = compute_snr(self.noise_scheduler, timesteps)
-            mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                dim=1
-            )[0]
             if self.noise_scheduler.config.prediction_type == "epsilon":
-                mse_loss_weights = mse_loss_weights / snr
+                target = noise
             elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                mse_loss_weights = mse_loss_weights / (snr + 1)
+                target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+            model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
-        
-        #avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-        #train_loss += avg_loss.item() / self.args.gradient_accumulation_steps
-        loss.backward()
+            if self.args.snr_gamma is None:
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            else:
+                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                # This is discussed in Section 4.2 of the same paper.
+                snr = compute_snr(self.noise_scheduler, timesteps)
+                mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                    dim=1
+                )[0]
+                if self.noise_scheduler.config.prediction_type == "epsilon":
+                    mse_loss_weights = mse_loss_weights / snr
+                elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                    mse_loss_weights = mse_loss_weights / (snr + 1)
+
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                loss = loss.mean()
+        with xp.Trace("model.backward"):
+            loss.backward()
         self.run_optimizer()
         return loss
 
@@ -286,7 +258,6 @@ def parse_args():
     parser.add_argument(
         "--train_batch_size", type=int, default=16, help="Batch size (per device) for the training dataloader."
     )
-    parser.add_argument("--num_train_epochs", type=int, default=100)
     parser.add_argument(
         "--max_train_steps",
         type=int,
@@ -475,34 +446,12 @@ def parse_args():
     )
 
     args = parser.parse_args()
-    env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
-    if env_local_rank != -1 and env_local_rank != args.local_rank:
-        args.local_rank = env_local_rank
-
-    # Sanity checks
-    if args.dataset_name is None and args.train_data_dir is None:
-        raise ValueError("Need either a dataset name or a training folder.")
 
     # default to using the same revision for the non-ema model if not specified
     if args.non_ema_revision is None:
         args.non_ema_revision = args.revision
 
     return args
-
-def setup_model_parallel() -> Tuple[int, int]:
-    # os.environ['MASTER_ADDR'] = 'localhost'
-    # os.environ['MASTER_PORT'] = '12355'
-    # assuming model parallelism over the whole world size
-    rank = xm.get_ordinal()
-    world_size = xm.xrt_world_size()
-    # torch.distributed.init_process_group("xla", rank=rank, world_size=world_size)
-    #torch.distributed.init_process_group("xla", init_method="xla://")
-
-    # seed must be the same in all processes
-    torch.manual_seed(1)
-    device = xm.xla_device()
-    xm.set_rng_state(1, device=device)
-    return rank, world_size
 
 def setup_optimizer(unet, args):
     optimizer_cls = torch.optim.AdamW
@@ -520,13 +469,10 @@ def main(args):
 
     server = xp.start_server(9012)
 
-    device = xm.xla_device()
-
     num_devices = xr.global_runtime_device_count()
-    args.train_batch_size = args.train_batch_size #* num_devices
     device_ids = np.arange(num_devices)
-    mesh_shape = (num_devices,1,1)
-    mesh = xs.Mesh(device_ids, mesh_shape, ('batch','fsdp', 'tensor'))
+    mesh_shape = (num_devices, 1)
+    mesh = xs.Mesh(device_ids, mesh_shape, ('x', 'y'))
     xs.set_global_mesh(mesh)
 
     text_encoder = CLIPTextModel.from_pretrained(
@@ -546,9 +492,7 @@ def main(args):
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    
     unet.train()
-
     optimizer = setup_optimizer(unet, args)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
@@ -559,173 +503,30 @@ def main(args):
     elif args.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    device = xm.xla_device()
     print("device: ", device)
     print("weight_dtype: ", weight_dtype)
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
-    # text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
     vae = vae.to(device, dtype=weight_dtype)
-    #vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
-    
-    #unet_compiled = torch.compile(unet, backend="openxla")
 
-     # set up dataset
-
-    if args.dataset_name is not None:
-        # Downloading and loading a dataset from the hub.
-        dataset = load_dataset(
-            args.dataset_name,
-            args.dataset_config_name,
-            cache_dir=args.cache_dir,
-            data_dir=args.train_data_dir,
-        )
-    else:
-        data_files = {}
-        if args.train_data_dir is not None:
-            data_files["train"] = os.path.join(args.train_data_dir, "**")
-        dataset = load_dataset(
-            "imagefolder",
-            data_files=data_files,
-            cache_dir=args.cache_dir,
-        )
-
-    column_names = dataset["train"].column_names
-
-    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
-    if args.image_column is None:
-        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        image_column = args.image_column
-        if image_column not in column_names:
-            raise ValueError(
-                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.caption_column is None:
-        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        caption_column = args.caption_column
-        if caption_column not in column_names:
-            raise ValueError(
-                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
-            )
-
-    def tokenize_captions(examples, is_train=True):
-        captions = []
-        for caption in examples[caption_column]:
-            if isinstance(caption, str):
-                captions.append(caption)
-            elif isinstance(caption, (list, np.ndarray)):
-                # take a random caption if there are multiple
-                captions.append(random.choice(caption) if is_train else caption[0])
-            else:
-                raise ValueError(
-                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
-                )
-        inputs = tokenizer(
-            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
-        )
-        #inputs.input_ids = inputs.input_ids.to(device)
-        return inputs.input_ids
-
-    # Preprocessing the datasets.
-    train_transforms = transforms.Compose(
-        [
-            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
-            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
-            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ]
-    )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
-        return examples
-
-    #if xm.is_master_ordinal():
-    if args.max_train_samples is not None:
-        dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-    # Set the training transforms
-    #compiled_preprocess_train = torch_xla.experimental.compile(preprocess_train)
-    train_dataset = dataset["train"]
-    train_dataset.set_format('torch')
-    train_dataset.set_transform(preprocess_train)
-
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        input_ids = input_ids.to(device)
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
-
-    train_sampler = None
-    if xr.world_size() > 1:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
-            num_replicas=xr.world_size(),
-            rank=xr.global_ordinal(),
-            shuffle=True
-        )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=False if train_sampler else True,
-        collate_fn=collate_fn,
-        batch_size=args.train_batch_size,
-        sampler=train_sampler,
-        num_workers=args.dataloader_num_workers,
-    )
-
-    train_dataloader = pl.MpDeviceLoader(
-        train_dataloader,
-        device,
-    )
-
-    #train_dataloader.dataset=train_dataset
-
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if args.max_train_steps is None:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * torch_xla.runtime.world_size(),
-        num_training_steps=args.max_train_steps * torch_xla.runtime.world_size(),
-    )
-
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-    if overrode_max_train_steps:
-        args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
-    # Afterwards we recalculate our number of training epochs
-    args.num_train_epochs = math.ceil(args.max_train_steps / num_update_steps_per_epoch)
-
-    # Train!
 
     if xm.is_master_ordinal():
         print("***** Running training *****")
-        print(f"  Num examples = {len(train_dataset)}")
-        print(f"  Num Epochs = {args.num_train_epochs}")
         print(f"  Instantaneous batch size per device = {args.train_batch_size // num_devices}")
         print(f"  Total train batch size (w. parallel, distributed & accumulation) = {args.train_batch_size}")
         print(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
         print(f"  Total optimization steps = {args.max_train_steps}")
 
-    trainer = TrainSD(first_epoch=0,
-                      vae=vae,
+    trainer = TrainSD(vae=vae,
                       weight_dtype=weight_dtype,
                       device=device,
                       noise_scheduler=noise_scheduler,
                       unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
-                      data_loader=train_dataloader,
                       args=args)
     
     trainer.start_training()
@@ -741,5 +542,3 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args()
     main(args)
-    print(met.metrics_report())
-    #xmp.spawn(main,args=())
