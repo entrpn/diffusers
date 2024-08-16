@@ -48,8 +48,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
+datasets.set_caching_enabled(False)
 
-PROFILE_DIR='/home/jfacevedo/pxla_profile/'
+PROFILE_DIR='gs://bbahl/sd2/'
 
 xr.initialize_cache('/tmp/xla_cache/', readonly=False)
 
@@ -73,12 +74,10 @@ class TrainSD():
         self.text_encoder = text_encoder
         self.data_loader = data_loader
         self.args = args
+        self.mesh = xs.get_global_mesh()
 
         num_devices = xr.global_runtime_device_count()
         device_ids = np.arange(num_devices)
-        mesh_shape = (num_devices,)
-        mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
-
         self.compiled_step_fn = torch_xla.experimental.compile(
             self.step_fn
         )
@@ -88,24 +87,16 @@ class TrainSD():
         self.optimizer.step()
     
     def train_loop_fn(self, train_dataloader, epoch):
-        last_time = time.time()
+        
         for step, batch in enumerate(train_dataloader):
+            last_time = time.time()
             # if step == 1:
             #     xp.trace_detached('localhost:9012', PROFILE_DIR)
             #with xp.StepTrace('Training_step',step_num=step):
-            #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
+            xs.mark_sharding(batch['pixel_values'], self.mesh, ("batch", None, None, None))
+            xs.mark_sharding(batch['input_ids'], self.mesh, ("batch", None))
             loss = self.compiled_step_fn(batch)
-            if xm.is_master_ordinal():
-                if step % 10 == 0:
-                    avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-                    xm.add_step_closure(
-                        self.train_update, args=(step, avg_loss, (time.time() - last_time))
-                    )
-                    #print(f'step: {step}, loss : {avg_loss}, step_step_time: {time.time() - last_time}')
-            #     else:
-            xm.mark_step()
-            #print(f"step: {step}, step_time: {time.time() - last_time}")
-            last_time = time.time()
+            print(f"step: {step}, step_time: {time.time() - last_time}")
             self.global_step += 1
             if self.global_step >= self.args.max_train_steps:
                 break
@@ -127,7 +118,6 @@ class TrainSD():
         batch
         ):
         self.optimizer.zero_grad()
-        
         latents = self.vae.encode(batch["pixel_values"]).latent_dist.sample()
         latents = latents * self.vae.config.scaling_factor
         noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
@@ -170,9 +160,7 @@ class TrainSD():
             loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
             loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
             loss = loss.mean()
-        
-        #avg_loss = torch_xla.core.xla_model.all_gather(loss.repeat(self.args.train_batch_size)).mean()
-        #train_loss += avg_loss.item() / self.args.gradient_accumulation_steps
+
         loss.backward()
         self.run_optimizer()
         return loss
@@ -495,14 +483,11 @@ def parse_args():
 
     return args
 
-def setup_model_parallel() -> Tuple[int, int]:
-    # os.environ['MASTER_ADDR'] = 'localhost'
-    # os.environ['MASTER_PORT'] = '12355'
-    # assuming model parallelism over the whole world size
+def setup_model_parallel(ddp=False) -> Tuple[int, int]:
     rank = xm.get_ordinal()
     world_size = xm.xrt_world_size()
-    # torch.distributed.init_process_group("xla", rank=rank, world_size=world_size)
-    #torch.distributed.init_process_group("xla", init_method="xla://")
+    if ddp:
+        torch.distributed.init_process_group("xla", init_method="xla://")
 
     # seed must be the same in all processes
     torch.manual_seed(1)
@@ -531,8 +516,9 @@ def main(args):
     num_devices = xr.global_runtime_device_count()
     args.train_batch_size = args.train_batch_size #* num_devices
     device_ids = np.arange(num_devices)
-    mesh_shape = (num_devices,1,1)
-    mesh = xs.Mesh(device_ids, mesh_shape, ('batch','fsdp', 'tensor'))
+    mesh_shape = (num_devices,)
+    mesh = xs.Mesh(device_ids, mesh_shape, ('batch',))
+    xs.set_global_mesh(mesh)
 
     text_encoder = CLIPTextModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
@@ -548,10 +534,10 @@ def main(args):
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
+    print(tokenizer.model_max_length)
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
-    
     unet.train()
 
     optimizer = setup_optimizer(unet, args)
@@ -569,11 +555,10 @@ def main(args):
 
     # Move text_encode and vae to gpu and cast to weight_dtype
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
-    # text_encoder_compiled = torch.compile(text_encoder, backend="openxla")
     vae = vae.to(device, dtype=weight_dtype)
-    vae_compiled = torch.compile(vae, backend="openxla")
+    # vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
-    unet_compiled = torch.compile(unet, backend="openxla")
+    # unet_compiled = torch.compile(unet, backend="openxla")
 
      # set up dataset
 
@@ -617,7 +602,8 @@ def main(args):
 
     def tokenize_captions(examples, is_train=True):
         captions = []
-        for caption in examples[caption_column]:
+        example_captions = [examples]
+        for caption in example_captions:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -630,7 +616,6 @@ def main(args):
         inputs = tokenizer(
             captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
         )
-        #inputs.input_ids = inputs.input_ids.to(device)
         return inputs.input_ids
 
     # Preprocessing the datasets.
@@ -643,21 +628,18 @@ def main(args):
             transforms.Normalize([0.5], [0.5]),
         ]
     )
-
-    def preprocess_train(examples):
-        images = [image.convert("RGB") for image in examples[image_column]]
-        examples["pixel_values"] = [train_transforms(image) for image in images]
-        examples["input_ids"] = tokenize_captions(examples)
-        return examples
-
-    #if xm.is_master_ordinal():
     if args.max_train_samples is not None:
         dataset["train"] = dataset["train"].shuffle(seed=args.seed).select(range(args.max_train_samples))
-    # Set the training transforms
-    #compiled_preprocess_train = torch_xla.experimental.compile(preprocess_train)
     train_dataset = dataset["train"]
-    train_dataset.set_format('torch')
-    train_dataset.set_transform(preprocess_train)
+    preprocessed_dataset = {"pixel_values": [], "input_ids":[]}
+    for i in range(len(train_dataset)):
+        image = train_dataset[i]['image'].convert("RGB")
+        image = train_transforms(image)
+        text = tokenize_captions(train_dataset[i]['text'])
+        preprocessed_dataset["pixel_values"].append(image)
+        preprocessed_dataset["input_ids"].append(text.squeeze())
+    ds = datasets.Dataset.from_dict(preprocessed_dataset)
+    ds.set_format('torch')
 
     def collate_fn(examples):
         pixel_values = torch.stack([example["pixel_values"] for example in examples])
@@ -669,14 +651,14 @@ def main(args):
     train_sampler = None
     if xr.world_size() > 1:
         train_sampler = torch.utils.data.distributed.DistributedSampler(
-            train_dataset,
+            ds,
             num_replicas=xr.world_size(),
             rank=xr.global_ordinal(),
             shuffle=True
         )
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
+        ds,
         shuffle=False if train_sampler else True,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
@@ -684,31 +666,16 @@ def main(args):
         num_workers=args.dataloader_num_workers,
     )
 
-    data_sharding = {
-        "input_ids" : xs.ShardingSpec(mesh, ('batch',None)),
-        "pixel_values" : xs.ShardingSpec(mesh, ('batch',None, None, None)),
-    }
-
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         device,
-        input_sharding=data_sharding
     )
-
-    train_dataloader.dataset=train_dataset
 
     overrode_max_train_steps = False
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
-
-    lr_scheduler = get_scheduler(
-        args.lr_scheduler,
-        optimizer=optimizer,
-        num_warmup_steps=args.lr_warmup_steps * torch_xla.runtime.world_size(),
-        num_training_steps=args.max_train_steps * torch_xla.runtime.world_size(),
-    )
 
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -728,11 +695,11 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
 
     trainer = TrainSD(first_epoch=0,
-                      vae=vae_compiled,
+                      vae=vae,
                       weight_dtype=weight_dtype,
                       device=device,
                       noise_scheduler=noise_scheduler,
-                      unet=unet_compiled,
+                      unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
                       data_loader=train_dataloader,
