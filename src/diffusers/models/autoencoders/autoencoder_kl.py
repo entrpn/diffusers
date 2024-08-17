@@ -31,7 +31,7 @@ from ..attention_processor import (
 from ..modeling_outputs import AutoencoderKLOutput
 from ..modeling_utils import ModelMixin
 from .vae import Decoder, DecoderOutput, DiagonalGaussianDistribution, Encoder
-
+import torch_xla.debug.profiler as xp
 
 class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
     r"""
@@ -245,6 +245,7 @@ class AutoencoderKL(ModelMixin, ConfigMixin, FromOriginalModelMixin):
 
         self.set_attn_processor(processor)
 
+    @xp.trace_me("autoencoder.forward")
     @apply_forward_hook
     def encode(
         self, x: torch.Tensor, return_dict: bool = True

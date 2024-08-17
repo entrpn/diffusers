@@ -50,7 +50,7 @@ from .unet_2d_blocks import (
     get_mid_block,
     get_up_block,
 )
-
+import torch_xla.debug.profiler as xp
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -1036,6 +1036,7 @@ class UNet2DConditionModel(
             encoder_hidden_states = (encoder_hidden_states, image_embeds)
         return encoder_hidden_states
 
+    @xp.trace_me("unet.forward")
     def forward(
         self,
         sample: torch.Tensor,
