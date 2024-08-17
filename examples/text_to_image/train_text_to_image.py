@@ -48,9 +48,10 @@ import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
 
-PROFILE_DIR='/mnt/disks/bbahl/pxla_profile/'
-
-xr.initialize_cache('/mnt/disks/bbahl/tmp/xla_cache/', readonly=False)
+PROFILE_DIR=os.environ.get('PROFILE_DIR', '/tmp/profile/')
+CACHE_DIR = os.environ.get('CACHE_DIR', None)
+if CACHE_DIR:
+    xr.initialize_cache(CACHE_DIR, readonly=False)
 xr.use_spmd()
 
 class TrainSD():
@@ -76,19 +77,19 @@ class TrainSD():
         self.optimizer.step()
 
     def start_training(self):
-        start_time = 0
+        times = []
         last_time = time.time()
         for step in range(self.args.max_train_steps):
             if step == 2:
-                xp.trace_detached('localhost:9012', PROFILE_DIR)
-                start_time = time.time()
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
             loss = self.step_fn(self.pixel_values, self.input_ids)
             xm.mark_step()
-            print(f"step: {step}, step_time: {time.time() - last_time}")
+            step_time = time.time() - last_time
+            times.append(step_time)
+            print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
+        print(f"Average step time: {sum(times)/len(times)}")
         xm.wait_device_ops()
-        end_time = time.time()
-        print("Average step time from step 3 onwards: ", (end_time-start_time)/(args.max_train_steps-2))
 
     def step_fn(
         self,
@@ -493,7 +494,6 @@ def main(args):
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet.train()
-    optimizer = setup_optimizer(unet, args)
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -511,7 +511,7 @@ def main(args):
     text_encoder = text_encoder.to(device, dtype=weight_dtype)
     vae = vae.to(device, dtype=weight_dtype)
     unet = unet.to(device, dtype=weight_dtype)
-
+    optimizer = setup_optimizer(unet, args)
 
     if xm.is_master_ordinal():
         print("***** Running training *****")
