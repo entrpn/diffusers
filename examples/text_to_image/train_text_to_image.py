@@ -18,8 +18,7 @@ import torch
 import torch.nn.functional as F
 import torch.utils.checkpoint
 import transformers
-# from accelerate import Accelerator
-from datasets import load_dataset
+
 from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -53,10 +52,13 @@ CACHE_DIR = os.environ.get('CACHE_DIR', None)
 if CACHE_DIR:
     xr.initialize_cache(CACHE_DIR, readonly=False)
 xr.use_spmd()
+DATASET_NAME_MAPPING = {
+    "lambdalabs/naruto-blip-captions": ("image", "text"),
+}
 
 class TrainSD():
 
-    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, args):
+    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, dataloader, args):
         self.vae = vae
         self.weight_dtype = weight_dtype
         self.device = device
@@ -66,11 +68,7 @@ class TrainSD():
         self.text_encoder = text_encoder
         self.args = args
         self.mesh = xs.get_global_mesh()
-        self.pixel_values = torch.randn((args.train_batch_size, 3, 512, 512), dtype=weight_dtype, device=device)
-        # Tokenizer pads all input text to a length of 77.
-        self.input_ids = torch.randint(0, 1000, (args.train_batch_size, 77), dtype=torch.int64, device=device)
-        xs.mark_sharding(self.pixel_values, self.mesh, ('x', None, None, None))
-        xs.mark_sharding(self.input_ids, self.mesh, ('x', None))
+        self.dataloader = dataloader
         self.global_step = 0
 
     def run_optimizer(self):
@@ -79,15 +77,21 @@ class TrainSD():
     def start_training(self):
         times = []
         last_time = time.time()
-        for step in range(self.args.max_train_steps):
+        for step, batch in enumerate(self.dataloader):
+            if self.global_step >= self.args.max_train_steps:
+                break
             if step == 2:
                 xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
-            loss = self.step_fn(self.pixel_values, self.input_ids)
+            xs.mark_sharding(batch["pixel_values"], self.mesh, ('x', None, None, None))
+            xs.mark_sharding(batch["input_ids"], self.mesh, ('x', None))
+            loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             xm.mark_step()
             step_time = time.time() - last_time
-            times.append(step_time)
+            if step > 2:
+                times.append(step_time)
             print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
+            self.global_step += 1
         print(f"Average step time: {sum(times)/len(times)}")
         xm.wait_device_ops()
 
@@ -464,6 +468,48 @@ def setup_optimizer(unet, args):
         eps=args.adam_epsilon,
     )
 
+def load_dataset(args):
+    if args.dataset_name is not None:
+        # Downloading and loading a dataset from the hub.
+        dataset = datasets.load_dataset(
+            args.dataset_name,
+            args.dataset_config_name,
+            cache_dir=args.cache_dir,
+            data_dir=args.train_data_dir,
+        )
+    else:
+        data_files = {}
+        if args.train_data_dir is not None:
+            data_files["train"] = os.path.join(args.train_data_dir, "**")
+        dataset = datasets.load_dataset(
+            "imagefolder",
+            data_files=data_files,
+            cache_dir=args.cache_dir,
+        )
+    return dataset
+
+def get_column_names(dataset, args):
+    column_names = dataset["train"].column_names
+
+    dataset_columns = DATASET_NAME_MAPPING.get(args.dataset_name, None)
+    if args.image_column is None:
+        image_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
+    else:
+        image_column = args.image_column
+        if image_column not in column_names:
+            raise ValueError(
+                f"--image_column' value '{args.image_column}' needs to be one of: {', '.join(column_names)}"
+            )
+    if args.caption_column is None:
+        caption_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
+    else:
+        caption_column = args.caption_column
+        if caption_column not in column_names:
+            raise ValueError(
+                f"--caption_column' value '{args.caption_column}' needs to be one of: {', '.join(column_names)}"
+            )
+    return image_column, caption_column
+
 def main(args):
 
     args = parse_args()
@@ -513,6 +559,69 @@ def main(args):
     unet = unet.to(device, dtype=weight_dtype)
     optimizer = setup_optimizer(unet, args)
 
+    dataset = load_dataset(args)
+    image_column, caption_column = get_column_names(dataset, args)
+
+    def tokenize_captions(examples, is_train=True):
+        captions = []
+        example_captions = [examples]
+        for caption in example_captions:
+            if isinstance(caption, str):
+                captions.append(caption)
+            elif isinstance(caption, (list, np.ndarray)):
+                # take a random caption if there are multiple
+                captions.append(random.choice(caption) if is_train else caption[0])
+            else:
+                raise ValueError(
+                    f"Caption column `{caption_column}` should contain either strings or lists of strings."
+                )
+        inputs = tokenizer(
+            captions, max_length=tokenizer.model_max_length, padding="max_length", truncation=True, return_tensors="pt"
+        )
+        return inputs.input_ids
+    
+    train_transforms = transforms.Compose(
+        [
+            transforms.Resize(args.resolution, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.CenterCrop(args.resolution) if args.center_crop else transforms.RandomCrop(args.resolution),
+            transforms.RandomHorizontalFlip() if args.random_flip else transforms.Lambda(lambda x: x),
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ]
+    )
+
+    print("Processing dataset ...")
+    train_dataset_hf = dataset["train"]
+    preprocessed_dataset = {"pixel_values": [], "input_ids":[]}
+    # huggingface dataset.map gets stuck. Manually processing the dataset.
+    for i in range(len(train_dataset_hf)):
+        image = train_dataset_hf[i][image_column].convert("RGB")
+        image = train_transforms(image)
+        text = tokenize_captions(train_dataset_hf[i][caption_column])
+        preprocessed_dataset["pixel_values"].append(image)
+        preprocessed_dataset["input_ids"].append(text.squeeze())
+    train_dataset = datasets.Dataset.from_dict(preprocessed_dataset)
+    train_dataset.set_format('torch')
+
+    # Preprocess data
+    xm.mark_step(wait=True)
+
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
+        input_ids = torch.stack([example["input_ids"] for example in examples])
+        input_ids = input_ids.to(device)
+        return {"pixel_values": pixel_values, "input_ids": input_ids}
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle= True,
+        collate_fn=collate_fn,
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
+
+
     if xm.is_master_ordinal():
         print("***** Running training *****")
         print(f"  Instantaneous batch size per device = {args.train_batch_size // num_devices}")
@@ -527,6 +636,7 @@ def main(args):
                       unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
+                      dataloader=train_dataloader,
                       args=args)
     
     trainer.start_training()
