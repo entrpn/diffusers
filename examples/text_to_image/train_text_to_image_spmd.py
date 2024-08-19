@@ -49,9 +49,9 @@ import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
 
-PROFILE_DIR='/mnt/disks/bbahl/pxla_profile/'
+PROFILE_DIR='/tmp/'
 
-xr.initialize_cache('/mnt/disks/bbahl/tmp/xla_cache/', readonly=False)
+xr.initialize_cache('/tmp/', readonly=False)
 
 torch_xla.experimental.eager_mode(True)
 xr.use_spmd()
@@ -85,17 +85,19 @@ class TrainSD():
 
     def run_optimizer(self):
         self.optimizer.step()
+        #xm.optimizer_step(self.optimizer) 
     
     def train_loop_fn(self, train_dataloader, epoch):
         last_time = time.time()
         for step, batch in enumerate(train_dataloader):
-            # if step == 1:
-            #     xp.trace_detached('localhost:9012', PROFILE_DIR)
-            #with xp.StepTrace('Training_step',step_num=step):
-            #loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
+            if step == 3:
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=15000)
+            # with xp.StepTrace('Training_step',step_num=step):
+            #     loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             xs.mark_sharding(batch["pixel_values"], self.mesh, ('batch', None, None, None))
             xs.mark_sharding(batch["input_ids"], self.mesh, ('batch', None))
-            loss = self.compiled_step_fn(batch)
+            #loss = self.compiled_step_fn(batch)
+            loss = self.step_fn(batch)
             xm.mark_step()
             print(met.short_metrics_report())
             print(f"step: {step}, step_time: {time.time() - last_time}")
@@ -549,8 +551,6 @@ def main(args):
     
     unet.train()
 
-    optimizer = setup_optimizer(unet, args)
-
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -568,6 +568,8 @@ def main(args):
     vae = vae.to(device, dtype=weight_dtype)
     #vae_compiled = torch.compile(vae, backend="openxla")
     unet = unet.to(device, dtype=weight_dtype)
+
+    optimizer = setup_optimizer(unet, args)
     
     #unet_compiled = torch.compile(unet, backend="openxla")
 
