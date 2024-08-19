@@ -46,8 +46,9 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
+from torch.profiler import profile, record_function, ProfilerActivity
 
-PROFILE_DIR=os.environ.get('PROFILE_DIR', '/tmp/profile/')
+PROFILE_DIR=os.environ.get('PROFILE_DIR', None)
 CACHE_DIR = os.environ.get('CACHE_DIR', None)
 if CACHE_DIR:
     xr.initialize_cache(CACHE_DIR, readonly=False)
@@ -79,8 +80,9 @@ class TrainSD():
         last_time = time.time()
         for step, batch in enumerate(self.dataloader):
             if self.global_step >= self.args.max_train_steps:
+                xm.mark_step()
                 break
-            if step == 2:
+            if step == 2 and PROFILE_DIR is not None:
                 xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
             xs.mark_sharding(batch["pixel_values"], self.mesh, ('x', None, None, None))
             xs.mark_sharding(batch["input_ids"], self.mesh, ('x', None))
@@ -125,6 +127,7 @@ class TrainSD():
                 raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
             model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
+        with xp.Trace("model.backward"):
             if self.args.snr_gamma is None:
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
             else:
@@ -143,7 +146,7 @@ class TrainSD():
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                 loss = loss.mean()
-        with xp.Trace("model.backward"):
+            
             loss.backward()
         self.run_optimizer()
         return loss
@@ -459,14 +462,15 @@ def parse_args():
     return args
 
 def setup_optimizer(unet, args):
-    optimizer_cls = torch.optim.AdamW
-    return optimizer_cls(
-        unet.parameters(),
-        lr=args.learning_rate,
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon,
-    )
+    # optimizer_cls = torch.optim.AdamW
+    # return optimizer_cls(
+    #     unet.parameters(),
+    #     lr=args.learning_rate,
+    #     betas=(args.adam_beta1, args.adam_beta2),
+    #     weight_decay=args.adam_weight_decay,
+    #     eps=args.adam_epsilon,
+    # )
+    return torch.optim.SGD(unet.parameters(), lr=args.learning_rate)
 
 def load_dataset(args):
     if args.dataset_name is not None:
@@ -607,10 +611,11 @@ def main(args):
     xm.mark_step(wait=True)
 
     def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
-        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        input_ids = input_ids.to(device)
+        with xp.Trace("dataloading"):
+            pixel_values = torch.stack([example["pixel_values"] for example in examples])
+            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
+            input_ids = torch.stack([example["input_ids"] for example in examples])
+            input_ids = input_ids.to(device)
         return {"pixel_values": pixel_values, "input_ids": input_ids}
 
     train_dataloader = torch.utils.data.DataLoader(
