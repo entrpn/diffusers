@@ -11,7 +11,6 @@ from contextlib import nullcontext
 from pathlib import Path
 
 import time
-import accelerate
 import datasets
 import numpy as np
 import torch
@@ -46,7 +45,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
-from torch.profiler import profile, record_function, ProfilerActivity
+from torch_xla.amp import syncfree
 
 PROFILE_DIR=os.environ.get('PROFILE_DIR', None)
 CACHE_DIR = os.environ.get('CACHE_DIR', None)
@@ -104,27 +103,28 @@ class TrainSD():
         ):
         with xp.Trace("model.forward"):
             self.optimizer.zero_grad()
-            latents = self.vae.encode(pixel_values).latent_dist.sample()
-            latents = latents * self.vae.config.scaling_factor
-            noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
-            bsz = latents.shape[0]
-            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-            timesteps = timesteps.long()
+            with torch.no_grad():
+                latents = self.vae.encode(pixel_values).latent_dist.sample()
+                latents = latents * self.vae.config.scaling_factor
+                noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
+                bsz = latents.shape[0]
+                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                timesteps = timesteps.long()
 
-            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+                noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
 
-            encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
-            
-            if self.args.prediction_type is not None:
-                # set prediction_type of scheduler if defined
-                self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+                encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+                
+                if self.args.prediction_type is not None:
+                    # set prediction_type of scheduler if defined
+                    self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
 
-            if self.noise_scheduler.config.prediction_type == "epsilon":
-                target = noise
-            elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-            else:
-                raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+                if self.noise_scheduler.config.prediction_type == "epsilon":
+                    target = noise
+                elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:
+                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
             model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
 
         with xp.Trace("model.backward"):
@@ -146,9 +146,10 @@ class TrainSD():
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                 loss = loss.mean()
-            
+                
             loss.backward()
-        self.run_optimizer()
+        with xp.Trace("optimizer_step"):
+            self.run_optimizer()
         return loss
 
 def parse_args():
@@ -462,15 +463,14 @@ def parse_args():
     return args
 
 def setup_optimizer(unet, args):
-    # optimizer_cls = torch.optim.AdamW
-    # return optimizer_cls(
-    #     unet.parameters(),
-    #     lr=args.learning_rate,
-    #     betas=(args.adam_beta1, args.adam_beta2),
-    #     weight_decay=args.adam_weight_decay,
-    #     eps=args.adam_epsilon,
-    # )
-    return torch.optim.SGD(unet.parameters(), lr=args.learning_rate)
+    optimizer_cls = syncfree.AdamW
+    return optimizer_cls(
+        unet.parameters(),
+        lr=args.learning_rate,
+        betas=(args.adam_beta1, args.adam_beta2),
+        weight_decay=args.adam_weight_decay,
+        eps=args.adam_epsilon,
+    )
 
 def load_dataset(args):
     if args.dataset_name is not None:
@@ -541,10 +541,6 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
 
-    vae.requires_grad_(False)
-    text_encoder.requires_grad_(False)
-    unet.train()
-
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float32
@@ -562,6 +558,10 @@ def main(args):
     vae = vae.to(device, dtype=weight_dtype)
     unet = unet.to(device, dtype=weight_dtype)
     optimizer = setup_optimizer(unet, args)
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.train()
+
 
     dataset = load_dataset(args)
     image_column, caption_column = get_column_names(dataset, args)
