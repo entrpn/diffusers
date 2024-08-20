@@ -128,8 +128,6 @@ class TrainSD():
                 else:
                     raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
             model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-        xm.mark_step()
-
         with xp.Trace("model.backward"):
             if self.args.snr_gamma is None:
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -542,6 +540,13 @@ def main(args):
     tokenizer = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="tokenizer", revision=args.revision
     )
+
+    from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear
+    unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
+
+    vae.requires_grad_(False)
+    text_encoder.requires_grad_(False)
+    unet.train()
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
