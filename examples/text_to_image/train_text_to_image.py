@@ -101,7 +101,7 @@ class TrainSD():
         pixel_values,
         input_ids,
         ):
-        with xp.Trace("model.forward"):
+        with xp.Trace("noise generation"):
             self.optimizer.zero_grad()
             with torch.no_grad():
                 latents = self.vae.encode(pixel_values).latent_dist.sample()
@@ -111,13 +111,15 @@ class TrainSD():
                 timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
-                noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-
-                encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
-                
-                if self.args.prediction_type is not None:
-                    # set prediction_type of scheduler if defined
-                    self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        xm.mark_step()
+        with xp.Trace("text_encoder"):
+            encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+        xm.mark_step()
+        with xp.Trace("unet"):
+            if self.args.prediction_type is not None:
+                # set prediction_type of scheduler if defined
+                self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
 
                 if self.noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
@@ -126,6 +128,7 @@ class TrainSD():
                 else:
                     raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
             model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+        xm.mark_step()
 
         with xp.Trace("model.backward"):
             if self.args.snr_gamma is None:
@@ -146,7 +149,6 @@ class TrainSD():
                 loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
                 loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
                 loss = loss.mean()
-                
             loss.backward()
         with xp.Trace("optimizer_step"):
             self.run_optimizer()
