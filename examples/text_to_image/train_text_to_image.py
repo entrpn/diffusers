@@ -78,14 +78,11 @@ class TrainSD():
         times = []
         last_time = time.time()
         for step, batch in enumerate(self.dataloader):
-            if self.global_step >= self.args.max_train_steps:
-                xm.mark_step()
-                break
             if step == 2 and PROFILE_DIR is not None:
-                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=1000)
             xs.mark_sharding(batch["pixel_values"], self.mesh, ('x', None, None, None))
             xs.mark_sharding(batch["input_ids"], self.mesh, ('x', None))
-            loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
+            r1, r2 = self.step_fn(batch["pixel_values"], batch["input_ids"])
             xm.mark_step()
             step_time = time.time() - last_time
             if step > 2:
@@ -93,6 +90,8 @@ class TrainSD():
             print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
             self.global_step += 1
+            if self.global_step >= self.args.max_train_steps:
+                break
         print(f"Average step time: {sum(times)/len(times)}")
         xm.wait_device_ops()
 
@@ -101,58 +100,61 @@ class TrainSD():
         pixel_values,
         input_ids,
         ):
-        with xp.Trace("noise generation"):
-            self.optimizer.zero_grad()
-            with torch.no_grad():
-                latents = self.vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-                noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
-                bsz = latents.shape[0]
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+        r1 = pixel_values+1
+        r2=input_ids+2
+        return r1, r2
+        # with xp.Trace("noise generation"):
+        #     self.optimizer.zero_grad()
+        #     with torch.no_grad():
+        #         latents = self.vae.encode(pixel_values).latent_dist.sample()
+        #         latents = latents * self.vae.config.scaling_factor
+        #         noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
+        #         bsz = latents.shape[0]
+        #         timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+        #         timesteps = timesteps.long()
 
-            noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        xm.mark_step()
-        with xp.Trace("text_encoder"):
-            encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
-        xm.mark_step()
-        with xp.Trace("unet"):
-            if self.args.prediction_type is not None:
-                # set prediction_type of scheduler if defined
-                self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+        #     noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
+        # xm.mark_step()
+        # with xp.Trace("text_encoder"):
+        #     encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
+        # xm.mark_step()
+        # with xp.Trace("unet"):
+        #     if self.args.prediction_type is not None:
+        #         # set prediction_type of scheduler if defined
+        #         self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
 
-                if self.noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
-            model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
-        xm.mark_step()
+        #         if self.noise_scheduler.config.prediction_type == "epsilon":
+        #             target = noise
+        #         elif self.noise_scheduler.config.prediction_type == "v_prediction":
+        #             target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+        #         else:
+        #             raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+        #     model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
+        # xm.mark_step()
 
-        with xp.Trace("model.backward"):
-            if self.args.snr_gamma is None:
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-            else:
-                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-                # This is discussed in Section 4.2 of the same paper.
-                snr = compute_snr(self.noise_scheduler, timesteps)
-                mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                    dim=1
-                )[0]
-                if self.noise_scheduler.config.prediction_type == "epsilon":
-                    mse_loss_weights = mse_loss_weights / snr
-                elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                    mse_loss_weights = mse_loss_weights / (snr + 1)
+        # with xp.Trace("model.backward"):
+        #     if self.args.snr_gamma is None:
+        #         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+        #     else:
+        #         # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+        #         # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+        #         # This is discussed in Section 4.2 of the same paper.
+        #         snr = compute_snr(self.noise_scheduler, timesteps)
+        #         mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+        #             dim=1
+        #         )[0]
+        #         if self.noise_scheduler.config.prediction_type == "epsilon":
+        #             mse_loss_weights = mse_loss_weights / snr
+        #         elif self.noise_scheduler.config.prediction_type == "v_prediction":
+        #             mse_loss_weights = mse_loss_weights / (snr + 1)
 
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-                loss = loss.mean()
-            loss.backward()
-        with xp.Trace("optimizer_step"):
-            self.run_optimizer()
-        return loss
+        #         loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+        #         loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+        #         loss = loss.mean()
+        #     loss.backward()
+        # with xp.Trace("optimizer_step"):
+        #     self.run_optimizer()
+        # return loss
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -570,8 +572,9 @@ def main(args):
 
     def tokenize_captions(examples, is_train=True):
         captions = []
-        example_captions = [examples]
-        for caption in example_captions:
+        # example_captions = [examples]
+        # for caption in example_captions:
+        for caption in examples[caption_column]:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -596,21 +599,29 @@ def main(args):
         ]
     )
 
-    print("Processing dataset ...")
-    train_dataset_hf = dataset["train"]
-    preprocessed_dataset = {"pixel_values": [], "input_ids":[]}
-    # huggingface dataset.map gets stuck. Manually processing the dataset.
-    for i in range(len(train_dataset_hf)):
-        image = train_dataset_hf[i][image_column].convert("RGB")
-        image = train_transforms(image)
-        text = tokenize_captions(train_dataset_hf[i][caption_column])
-        preprocessed_dataset["pixel_values"].append(image)
-        preprocessed_dataset["input_ids"].append(text.squeeze())
-    train_dataset = datasets.Dataset.from_dict(preprocessed_dataset)
-    train_dataset.set_format('torch')
+    # print("Processing dataset ...")
+    # train_dataset_hf = dataset["train"]
+    # preprocessed_dataset = {"pixel_values": [], "input_ids":[]}
+    # # huggingface dataset.map gets stuck. Manually processing the dataset.
+    # for i in range(len(train_dataset_hf)):
+    #     image = train_dataset_hf[i][image_column].convert("RGB")
+    #     image = train_transforms(image)
+    #     text = tokenize_captions(train_dataset_hf[i][caption_column])
+    #     preprocessed_dataset["pixel_values"].append(image)
+    #     preprocessed_dataset["input_ids"].append(text.squeeze())
+    # train_dataset = datasets.Dataset.from_dict(preprocessed_dataset)
+    # train_dataset.set_format('torch')
 
-    # Preprocess data
-    xm.mark_step(wait=True)
+    # # Preprocess data
+    # xm.mark_step(wait=True)
+    def preprocess_train(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
+        examples["input_ids"] = tokenize_captions(examples)
+        return examples
+    train_dataset = dataset["train"]
+    train_dataset.set_format('torch')
+    train_dataset.set_transform(preprocess_train)
 
     def collate_fn(examples):
         with xp.Trace("dataloading"):
