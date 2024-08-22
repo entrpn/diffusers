@@ -101,32 +101,27 @@ class TrainSD():
         pixel_values,
         input_ids,
         ):
-        with xp.Trace("noise generation"):
+        with xp.Trace("model.forward"):
             self.optimizer.zero_grad()
-            with torch.no_grad():
-                latents = self.vae.encode(pixel_values).latent_dist.sample()
-                latents = latents * self.vae.config.scaling_factor
-                noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
-                bsz = latents.shape[0]
-                timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
+            latents = self.vae.encode(pixel_values).latent_dist.sample()
+            latents = latents * self.vae.config.scaling_factor
+            noise = torch.randn_like(latents).to(self.device, dtype=self.weight_dtype)
+            bsz = latents.shape[0]
+            timesteps = torch.randint(0, self.noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+            timesteps = timesteps.long()
 
             noisy_latents = self.noise_scheduler.add_noise(latents, noise, timesteps)
-        xm.mark_step()
-        with xp.Trace("text_encoder"):
             encoder_hidden_states = self.text_encoder(input_ids, return_dict=False)[0]
-        xm.mark_step()
-        with xp.Trace("unet"):
             if self.args.prediction_type is not None:
                 # set prediction_type of scheduler if defined
                 self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
 
-                if self.noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                    target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+            if self.noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                target = self.noise_scheduler.get_velocity(latents, noise, timesteps)
+            else:
+                raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
             model_pred = self.unet(noisy_latents, timesteps, encoder_hidden_states, return_dict=False)[0]
         with xp.Trace("model.backward"):
             if self.args.snr_gamma is None:
@@ -463,7 +458,7 @@ def parse_args():
     return args
 
 def setup_optimizer(unet, args):
-    optimizer_cls = syncfree.AdamW
+    optimizer_cls = torch.optim.AdamW
     return optimizer_cls(
         unet.parameters(),
         lr=args.learning_rate,
