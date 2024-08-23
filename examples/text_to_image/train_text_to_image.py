@@ -467,6 +467,7 @@ def setup_optimizer(unet, args):
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
+        foreach=True
     )
 
 def load_dataset(args):
