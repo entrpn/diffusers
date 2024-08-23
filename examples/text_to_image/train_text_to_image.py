@@ -83,6 +83,8 @@ class TrainSD():
                 break
             if step == 2 and PROFILE_DIR is not None:
                 xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
+            batch["pixel_values"] = batch["pixel_values"].to(self.device)
+            batch["input_ids"] = batch["input_ids"].to(self.device)
             xs.mark_sharding(batch["pixel_values"], self.mesh, ('x', None, None, None))
             xs.mark_sharding(batch["input_ids"], self.mesh, ('x', None))
             loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
@@ -570,8 +572,7 @@ def main(args):
 
     def tokenize_captions(examples, is_train=True):
         captions = []
-        example_captions = [examples]
-        for caption in example_captions:
+        for caption in examples[caption_column]:
             if isinstance(caption, str):
                 captions.append(caption)
             elif isinstance(caption, (list, np.ndarray)):
@@ -596,36 +597,28 @@ def main(args):
         ]
     )
 
-    print("Processing dataset ...")
-    train_dataset_hf = dataset["train"]
-    preprocessed_dataset = {"pixel_values": [], "input_ids":[]}
-    # huggingface dataset.map gets stuck. Manually processing the dataset.
-    for i in range(len(train_dataset_hf)):
-        image = train_dataset_hf[i][image_column].convert("RGB")
-        image = train_transforms(image)
-        text = tokenize_captions(train_dataset_hf[i][caption_column])
-        preprocessed_dataset["pixel_values"].append(image)
-        preprocessed_dataset["input_ids"].append(text.squeeze())
-    train_dataset = datasets.Dataset.from_dict(preprocessed_dataset)
+    def preprocess_train(examples):
+        images = [image.convert("RGB") for image in examples[image_column]]
+        examples["pixel_values"] = [train_transforms(image) for image in images]
+        examples["input_ids"] = tokenize_captions(examples)
+        return examples
+    train_dataset = dataset["train"]
     train_dataset.set_format('torch')
-
-    # Preprocess data
-    xm.mark_step(wait=True)
+    train_dataset.set_transform(preprocess_train)
 
     def collate_fn(examples):
-        with xp.Trace("dataloading"):
-            pixel_values = torch.stack([example["pixel_values"] for example in examples])
-            pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(device, weight_dtype)
-            input_ids = torch.stack([example["input_ids"] for example in examples])
-            input_ids = input_ids.to(device)
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+        pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(weight_dtype)
+        input_ids = torch.stack([example["input_ids"] for example in examples])
         return {"pixel_values": pixel_values, "input_ids": input_ids}
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle= True,
+        shuffle=False,
         collate_fn=collate_fn,
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
+        drop_last=True
     )
 
 
