@@ -58,7 +58,7 @@ DATASET_NAME_MAPPING = {
 
 class TrainSD():
 
-    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, dataloader, args):
+    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, imageloader, textloader, args):
         self.vae = vae
         self.weight_dtype = weight_dtype
         self.device = device
@@ -68,7 +68,8 @@ class TrainSD():
         self.text_encoder = text_encoder
         self.args = args
         self.mesh = xs.get_global_mesh()
-        self.dataloader = dataloader
+        self.imageloader = iter(imageloader)
+        self.textloader = iter(textloader)
         self.global_step = 0
 
     def run_optimizer(self):
@@ -77,17 +78,20 @@ class TrainSD():
     def start_training(self):
         times = []
         last_time = time.time()
-        for step, batch in enumerate(self.dataloader):
+        step = 0
+        while True:
             if self.global_step >= self.args.max_train_steps:
                 xm.mark_step()
                 break
             if step == 2 and PROFILE_DIR is not None:
                 xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
-            batch["pixel_values"] = batch["pixel_values"].to(self.device)
-            batch["input_ids"] = batch["input_ids"].to(self.device)
-            xs.mark_sharding(batch["pixel_values"], self.mesh, ('x', None, None, None))
-            xs.mark_sharding(batch["input_ids"], self.mesh, ('x', None))
-            loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
+            try:
+                image = next(self.imageloader)
+                text=next(self.textloader)
+            except:
+                print("stop iteration")
+                break
+            loss = self.step_fn(image, text)
             xm.mark_step()
             step_time = time.time() - last_time
             if step > 2:
@@ -95,6 +99,7 @@ class TrainSD():
             print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
             self.global_step += 1
+            step += 1
         print(f"Average step time: {sum(times)/len(times)}")
         xm.wait_device_ops()
 
@@ -467,7 +472,7 @@ def setup_optimizer(unet, args):
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
-        foreach=True
+        foreach=True,
     )
 
 def load_dataset(args):
@@ -607,19 +612,46 @@ def main(args):
     train_dataset.set_format('torch')
     train_dataset.set_transform(preprocess_train)
 
-    def collate_fn(examples):
-        pixel_values = torch.stack([example["pixel_values"] for example in examples])
+    def collate_images(examples):
+        # print("collate images", examples)
+        pixel_values = torch.stack([example['pixel_values'] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(weight_dtype)
-        input_ids = torch.stack([example["input_ids"] for example in examples])
-        return {"pixel_values": pixel_values, "input_ids": input_ids}
+        return pixel_values
 
-    train_dataloader = torch.utils.data.DataLoader(
+    def collate_text(examples):
+        # print("collate text", examples)
+        input_ids = torch.stack([example['input_ids'] for example in examples])
+        return input_ids
+
+    train_imageloader = torch.utils.data.DataLoader(
         train_dataset,
         shuffle=False,
-        collate_fn=collate_fn,
+        collate_fn=collate_images,
         batch_size=args.train_batch_size,
-        num_workers=args.dataloader_num_workers,
+        num_workers=8,
         drop_last=True
+    )
+    train_textloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=False,
+        collate_fn=collate_text,
+        batch_size=args.train_batch_size,
+        num_workers=8,
+        drop_last=True
+    )
+    train_imageloader = pl.MpDeviceLoader(
+        train_imageloader,
+        device,
+        input_sharding=xs.ShardingSpec(mesh, ('x',None, None, None)),
+        loader_prefetch_size=16,
+        device_prefetch_size=16,
+    )
+    train_textloader = pl.MpDeviceLoader(
+        train_textloader,
+        device,
+        input_sharding=xs.ShardingSpec(mesh, ('x', None)),
+        loader_prefetch_size=16,
+        device_prefetch_size=16,
     )
 
 
@@ -637,7 +669,8 @@ def main(args):
                       unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
-                      dataloader=train_dataloader,
+                      imageloader=train_imageloader,
+                      textloader=train_textloader,
                       args=args)
     
     trainer.start_training()
