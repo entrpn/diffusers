@@ -83,7 +83,7 @@ class TrainSD():
                 xm.mark_step()
                 break
             if step == 4 and PROFILE_DIR is not None:
-                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=20000)
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=args.profile_duration)
             try:
                 batch = next(self.dataloader)
             except:
@@ -155,6 +155,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
     parser.add_argument(
         "--input_perturbation", type=float, default=0, help="The scale of input perturbation. Recommended 0.1."
+    )
+    parser.add_argument(
+        "--profile_duration", type=int, default=10000, help="Profile duration in ms"
     )
     parser.add_argument(
         "--pretrained_model_name_or_path",
