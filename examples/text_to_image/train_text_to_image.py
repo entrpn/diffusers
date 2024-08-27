@@ -7,6 +7,7 @@ import math
 import os
 import random
 import shutil
+import itertools
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -45,7 +46,6 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 import torch_xla.debug.metrics as met
 import torch.distributed as dist
 import torch_xla.distributed.xla_backend
-from torch_xla.amp import syncfree
 
 PROFILE_DIR=os.environ.get('PROFILE_DIR', None)
 CACHE_DIR = os.environ.get('CACHE_DIR', None)
@@ -58,7 +58,7 @@ DATASET_NAME_MAPPING = {
 
 class TrainSD():
 
-    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, imageloader, textloader, args):
+    def __init__(self, vae, weight_dtype, device, noise_scheduler, unet, optimizer, text_encoder, dataloader, args):
         self.vae = vae
         self.weight_dtype = weight_dtype
         self.device = device
@@ -68,8 +68,7 @@ class TrainSD():
         self.text_encoder = text_encoder
         self.args = args
         self.mesh = xs.get_global_mesh()
-        self.imageloader = iter(imageloader)
-        self.textloader = iter(textloader)
+        self.dataloader = iter(dataloader)
         self.global_step = 0
 
     def run_optimizer(self):
@@ -83,18 +82,16 @@ class TrainSD():
             if self.global_step >= self.args.max_train_steps:
                 xm.mark_step()
                 break
-            if step == 2 and PROFILE_DIR is not None:
-                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=10000)
+            if step == 4 and PROFILE_DIR is not None:
+                xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=20000)
             try:
-                image = next(self.imageloader)
-                text=next(self.textloader)
+                batch = next(self.dataloader)
             except:
                 print("stop iteration")
                 break
-            loss = self.step_fn(image, text)
-            xm.mark_step()
+            loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             step_time = time.time() - last_time
-            if step > 2:
+            if step > 3:
                 times.append(step_time)
             print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
@@ -363,6 +360,22 @@ def parse_args():
             "Number of subprocesses to use for data loading. 0 means that the data will be loaded in the main process."
         ),
     )
+    parser.add_argument(
+        "--loader_prefetch_size",
+        type=int,
+        default=1,
+        help=(
+            "Number of subprocesses to use for data loading to cpu."
+        ),
+    )
+    parser.add_argument(
+        "--device_prefetch_size",
+        type=int,
+        default=1,
+        help=(
+            "Number of subprocesses to use for data loading to tpu from cpu. "
+        ),
+    )
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="The beta1 parameter for the Adam optimizer.")
     parser.add_argument("--adam_beta2", type=float, default=0.999, help="The beta2 parameter for the Adam optimizer.")
     parser.add_argument("--adam_weight_decay", type=float, default=1e-2, help="Weight decay to use.")
@@ -608,52 +621,35 @@ def main(args):
         examples["pixel_values"] = [train_transforms(image) for image in images]
         examples["input_ids"] = tokenize_captions(examples)
         return examples
+
     train_dataset = dataset["train"]
     train_dataset.set_format('torch')
     train_dataset.set_transform(preprocess_train)
-
-    def collate_images(examples):
-        # print("collate images", examples)
-        pixel_values = torch.stack([example['pixel_values'] for example in examples])
+    
+    def collate_fn(examples):
+        pixel_values = torch.stack([example["pixel_values"] for example in examples])
         pixel_values = pixel_values.to(memory_format=torch.contiguous_format).to(weight_dtype)
-        return pixel_values
+        input_ids = torch.stack([example["input_ids"] for example in examples])
+        return {"pixel_values": pixel_values, "input_ids": input_ids}
 
-    def collate_text(examples):
-        # print("collate text", examples)
-        input_ids = torch.stack([example['input_ids'] for example in examples])
-        return input_ids
-
-    train_imageloader = torch.utils.data.DataLoader(
+    g = torch.Generator()
+    g.manual_seed(0)
+    sampler = torch.utils.data.RandomSampler(train_dataset, replacement=True, num_samples=int(1e10), generator=g)
+    train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
-        shuffle=False,
-        collate_fn=collate_images,
+        sampler=sampler,
+        collate_fn=collate_fn,
+        num_workers=args.dataloader_num_workers,
         batch_size=args.train_batch_size,
-        num_workers=8,
-        drop_last=True
-    )
-    train_textloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=False,
-        collate_fn=collate_text,
-        batch_size=args.train_batch_size,
-        num_workers=8,
-        drop_last=True
-    )
-    train_imageloader = pl.MpDeviceLoader(
-        train_imageloader,
-        device,
-        input_sharding=xs.ShardingSpec(mesh, ('x',None, None, None)),
-        loader_prefetch_size=16,
-        device_prefetch_size=16,
-    )
-    train_textloader = pl.MpDeviceLoader(
-        train_textloader,
-        device,
-        input_sharding=xs.ShardingSpec(mesh, ('x', None)),
-        loader_prefetch_size=16,
-        device_prefetch_size=16,
     )
 
+    train_dataloader = pl.MpDeviceLoader(
+        train_dataloader,
+        device,
+        input_sharding={"pixel_values": xs.ShardingSpec(mesh, ('x',None, None, None)), "input_ids": xs.ShardingSpec(mesh, ('x',None))},
+        loader_prefetch_size=args.loader_prefetch_size,
+        device_prefetch_size=args.device_prefetch_size,
+    )
 
     if xm.is_master_ordinal():
         print("***** Running training *****")
@@ -669,8 +665,7 @@ def main(args):
                       unet=unet,
                       optimizer=optimizer,
                       text_encoder=text_encoder,
-                      imageloader=train_imageloader,
-                      textloader=train_textloader,
+                      dataloader=train_dataloader,
                       args=args)
     
     trainer.start_training()
