@@ -74,9 +74,6 @@ class TrainSD():
     def run_optimizer(self):
         self.optimizer.step()
     
-    def train_update(self, step, loss):
-        print(f'step: {step}, loss: {loss}')
-
     def start_training(self):
         times = []
         last_time = time.time()
@@ -99,7 +96,7 @@ class TrainSD():
                 times.append(step_time)
             print(f"step: {step}, step_time: {step_time}")
             if step%5 == 0:
-                xm.add_step_closure(self.train_update, args=(step, loss))
+                print(f'step: {step}, loss: {loss}')
             last_time = time.time()
             self.global_step += 1
             step += 1
