@@ -83,6 +83,7 @@ class TrainSD():
                 xm.mark_step()
                 break
             if step == 4 and PROFILE_DIR is not None:
+                xm.wait_device_ops()
                 xp.trace_detached('localhost:9012', PROFILE_DIR, duration_ms=args.profile_duration)
             try:
                 batch = next(self.dataloader)
@@ -91,7 +92,7 @@ class TrainSD():
                 break
             loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             step_time = time.time() - last_time
-            if step > 3:
+            if step > 4:
                 times.append(step_time)
             print(f"step: {step}, step_time: {step_time}")
             last_time = time.time()
