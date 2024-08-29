@@ -73,6 +73,9 @@ class TrainSD():
 
     def run_optimizer(self):
         self.optimizer.step()
+    
+    def train_update(self, step, loss):
+        print(f'step: {step}, loss: {loss}')
 
     def start_training(self):
         times = []
@@ -92,9 +95,11 @@ class TrainSD():
                 break
             loss = self.step_fn(batch["pixel_values"], batch["input_ids"])
             step_time = time.time() - last_time
-            if step > 4:
+            if step >= 10:
                 times.append(step_time)
             print(f"step: {step}, step_time: {step_time}")
+            if step%5 == 0:
+                xm.add_step_closure(self.train_update, args=(step, loss))
             last_time = time.time()
             self.global_step += 1
             step += 1
