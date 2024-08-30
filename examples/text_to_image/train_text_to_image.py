@@ -639,7 +639,7 @@ def main(args):
         return {"pixel_values": pixel_values, "input_ids": input_ids}
 
     g = torch.Generator()
-    g.manual_seed(0)
+    g.manual_seed(xr.host_index())
     sampler = torch.utils.data.RandomSampler(train_dataset, replacement=True, num_samples=int(1e10), generator=g)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
