@@ -652,7 +652,7 @@ def main(args):
     train_dataloader = pl.MpDeviceLoader(
         train_dataloader,
         device,
-        input_sharding={"pixel_values": xs.ShardingSpec(mesh, ('x',None, None, None)), "input_ids": xs.ShardingSpec(mesh, ('x',None))},
+        input_sharding={"pixel_values": xs.ShardingSpec(mesh, ('x',None, None, None), minibatch=True), "input_ids": xs.ShardingSpec(mesh, ('x',None), minibatch=True)},
         loader_prefetch_size=args.loader_prefetch_size,
         device_prefetch_size=args.device_prefetch_size,
     )
