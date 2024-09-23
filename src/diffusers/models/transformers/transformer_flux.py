@@ -31,11 +31,17 @@ from ...models.attention_processor import (
 )
 from ...models.modeling_utils import ModelMixin
 from ...models.normalization import AdaLayerNormContinuous, AdaLayerNormZero, AdaLayerNormZeroSingle
-from ...utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
+from ...utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers, is_torch_xla_available
 from ...utils.torch_utils import maybe_allow_in_graph
 from ..embeddings import CombinedTimestepGuidanceTextProjEmbeddings, CombinedTimestepTextProjEmbeddings, FluxPosEmbed
 from ..modeling_outputs import Transformer2DModelOutput
 
+if is_torch_xla_available():
+    import torch_xla.core.xla_model as xm
+
+    XLA_AVAILABLE = True
+else:
+    XLA_AVAILABLE = False
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -498,6 +504,8 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                 )
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
             # controlnet residual
             if controlnet_block_samples is not None:
@@ -534,6 +542,8 @@ class FluxTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrig
                     temb=temb,
                     image_rotary_emb=image_rotary_emb,
                 )
+                if XLA_AVAILABLE:
+                    xm.mark_step()
 
             # controlnet residual
             if controlnet_single_block_samples is not None:
