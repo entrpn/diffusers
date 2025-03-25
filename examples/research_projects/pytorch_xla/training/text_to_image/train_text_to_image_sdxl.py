@@ -31,6 +31,7 @@ from diffusers.training_utils import compute_snr
 from diffusers.utils import is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 
+# torch._dynamo.config.force_parameter_static_shapes = False
 
 if is_wandb_available():
     pass
@@ -148,16 +149,12 @@ class TrainSD:
         for step in range(0, self.args.max_train_steps):
             print("step: ", step)
             batch = next(self.dataloader)
-            if step == measure_start_step and PROFILE_DIR is not None:
-                xm.wait_device_ops()
-                xp.trace_detached(f"localhost:{PORT}", PROFILE_DIR, duration_ms=args.profile_duration)
+            if step == measure_start_step:
+                if PROFILE_DIR is not None:
+                    xm.wait_device_ops()
+                    xp.trace_detached(f"localhost:{PORT}", PROFILE_DIR, duration_ms=args.profile_duration)
                 last_time = time.time()
-            loss = self.step_fn(
-                batch["model_input"],
-                batch["prompt_embeds"],
-                batch["pooled_prompt_embeds"],
-                batch["original_sizes"],
-                batch["crop_top_lefts"])
+            loss = self.step_fn(batch)
             self.global_step += 1
 
             def print_loss_closure(step, loss):
@@ -182,15 +179,15 @@ class TrainSD:
 
     def step_fn(
         self,
-        model_input,
-        prompt_embeds,
-        pooled_prompt_embeds,
-        original_sizes,
-        crop_top_lefts
+        batch
     ):
         with xp.Trace("model.forward"):
             self.optimizer.zero_grad()
-            
+            model_input = batch["model_input"]
+            prompt_embeds = batch["prompt_embeds"]
+            pooled_prompt_embeds = batch["pooled_prompt_embeds"]
+            original_sizes = batch["original_sizes"]
+            crop_top_lefts = batch["crop_top_lefts"]
             
             noise = torch.randn_like(model_input).to(self.device, dtype=self.weight_dtype)
             bsz = model_input.shape[0]
@@ -638,6 +635,7 @@ def main(args):
     text_encoder_2 = text_encoder_2.to(device, dtype=weight_dtype)
     vae = vae.to(device, dtype=weight_dtype)
     unet = unet.to(device, dtype=weight_dtype)
+    #unet = torch.compile(unet, backend='openxla', dynamic=True)
     optimizer = setup_optimizer(unet, args)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)

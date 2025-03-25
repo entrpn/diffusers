@@ -3241,7 +3241,6 @@ class AttnProcessorNPU:
 def xla_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
     L, S = query.size(-2), key.size(-2)
     scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype)
     if is_causal:
         assert attn_mask is None
         temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
@@ -3254,7 +3253,6 @@ def xla_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_
         else:
             attn_bias += attn_mask
     attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
     attn_weight = torch.softmax(attn_weight, dim=-1)
     attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
     return attn_weight @ value
@@ -3330,7 +3328,7 @@ class AttnProcessor2_0:
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = self.xla_scaled_dot_product_attention(
+        hidden_states = F.scaled_dot_product_attention(
             query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
         )
 
@@ -3428,7 +3426,7 @@ class XLAFlashAttnProcessor2_0:
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
         if all(tensor.shape[2] >= 4096 for tensor in [query, key, value]):
-            logger.warning("Using flash attention")
+            # logger.warning("Using flash attention")
             if attention_mask is not None:
                 attention_mask = attention_mask.view(batch_size, 1, 1, attention_mask.shape[-1])
                 # Convert mask to float and replace 0s with -inf and 1s with 0
@@ -3444,9 +3442,9 @@ class XLAFlashAttnProcessor2_0:
             partition_spec = self.partition_spec if is_spmd() else None
             hidden_states = flash_attention(query, key, value, causal=False, partition_spec=partition_spec)
         else:
-            logger.warning(
-                "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
-            )
+            # logger.warning(
+            #     "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
+            # )
             hidden_states = xla_scaled_dot_product_attention(
                 query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
             )
