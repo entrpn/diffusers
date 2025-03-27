@@ -96,6 +96,7 @@ gcloud compute tpus tpu-vm ssh ${TPU_NAME} \
 --project=${PROJECT_ID} --zone=${ZONE} --worker=all \
 --command='
 export XLA_DISABLE_FUNCTIONALIZATION=1
+export TORCH_DISABLE_FUNCTIONALIZATION_META_REFERENCE=1
 export PROFILE_DIR=/tmp/
 export CACHE_DIR=/tmp/
 export DATASET_NAME=lambdalabs/naruto-blip-captions

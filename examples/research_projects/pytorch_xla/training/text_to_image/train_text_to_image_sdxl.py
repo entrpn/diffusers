@@ -31,8 +31,6 @@ from diffusers.training_utils import compute_snr
 from diffusers.utils import is_wandb_available
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 
-# torch._dynamo.config.force_parameter_static_shapes = False
-
 if is_wandb_available():
     pass
 
@@ -635,7 +633,6 @@ def main(args):
     text_encoder_2 = text_encoder_2.to(device, dtype=weight_dtype)
     vae = vae.to(device, dtype=weight_dtype)
     unet = unet.to(device, dtype=weight_dtype)
-    #unet = torch.compile(unet, backend='openxla', dynamic=True)
     optimizer = setup_optimizer(unet, args)
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -723,14 +720,6 @@ def main(args):
         crop_top_lefts = torch.stack([torch.tensor(example["crop_top_lefts"]) for example in examples])
         prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
         pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
-        # print("model_input.shape: ", model_input.shape)
-        # print("model_input.dtype: ", model_input.dtype)
-        # print("prompt_embeds.shape: ", prompt_embeds.shape)
-        # print("prompt_embeds.dtype: ", prompt_embeds.dtype)
-        # print("pooled_prompt_embeds.shape: ", pooled_prompt_embeds.shape)
-        # print("pooled_prompt_embeds.dtype: ", pooled_prompt_embeds.dtype)
-        # print("original_sizes.shape: ", original_sizes.shape)
-        # print("crop_top_lefts.shape: ", crop_top_lefts.shape)
         return {
           "model_input": model_input,
           "prompt_embeds": prompt_embeds,
