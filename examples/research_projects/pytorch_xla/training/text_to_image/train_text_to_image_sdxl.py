@@ -774,28 +774,45 @@ def main(args):
         args=args,
     )
     trainer.start_training()
-    # unet = trainer.unet.to("cpu")
-    # vae = trainer.vae.to("cpu")
-    # text_encoder = trainer.text_encoder.to("cpu")
+    unet = trainer.unet.to("cpu")
+    
+    text_encoder = CLIPTextModel.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="text_encoder",
+        revision=args.revision,
+        variant=args.variant,
+    )
+    text_encoder_2 = CLIPTextModelWithProjection.from_pretrained(
+      args.pretrained_model_name_or_path,
+      subfolder="text_encoder_2",
+      revision=args.revision,
+      variant=args.variant,
+    )
+    vae = AutoencoderKL.from_pretrained(
+        args.pretrained_model_name_or_path,
+        subfolder="vae",
+        revision=args.revision,
+        variant=args.variant,
+    )
 
-    # pipeline = StableDiffusionXLPipeline.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     text_encoder=text_encoder,
-    #     vae=vae,
-    #     unet=unet,
-    #     revision=args.revision,
-    #     variant=args.variant,
-    # )
-    # pipeline.save_pretrained(args.output_dir)
+    pipeline = StableDiffusionXLPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        text_encoder=text_encoder,
+        vae=vae,
+        unet=unet,
+        revision=args.revision,
+        variant=args.variant,
+    )
+    pipeline.save_pretrained(args.output_dir)
 
-    # if xm.is_master_ordinal() and args.push_to_hub:
-    #     save_model_card(args, repo_id, repo_folder=args.output_dir)
-    #     upload_folder(
-    #         repo_id=repo_id,
-    #         folder_path=args.output_dir,
-    #         commit_message="End of training",
-    #         ignore_patterns=["step_*", "epoch_*"],
-    #     )
+    if xm.is_master_ordinal() and args.push_to_hub:
+        save_model_card(args, repo_id, repo_folder=args.output_dir)
+        upload_folder(
+            repo_id=repo_id,
+            folder_path=args.output_dir,
+            commit_message="End of training",
+            ignore_patterns=["step_*", "epoch_*"],
+        )
 
 
 if __name__ == "__main__":

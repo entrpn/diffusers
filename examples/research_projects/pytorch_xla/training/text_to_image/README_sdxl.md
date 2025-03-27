@@ -100,10 +100,10 @@ export TORCH_DISABLE_FUNCTIONALIZATION_META_REFERENCE=1
 export PROFILE_DIR=/tmp/
 export CACHE_DIR=/tmp/
 export DATASET_NAME=lambdalabs/naruto-blip-captions
-export GLOBAL_BATCH_SIZE=32
+export PER_HOST_BATCH_SIZE=32
 export TRAIN_STEPS=50
 export OUTPUT_DIR=/tmp/trained-model/
-python examples/research_projects/pytorch_xla/training/text_to_image/train_text_to_image_sdxl.py --pretrained_model_name_or_path=stabilityai/stable-diffusion-xl-base-1.0 --dataset_name=$DATASET_NAME --resolution=1024 --center_crop --random_flip --train_batch_size=$GLOBAL_BATCH_SIZE  --max_train_steps=$TRAIN_STEPS --learning_rate=1e-06 --mixed_precision=bf16 --profile_duration=80000 --output_dir=$OUTPUT_DIR --dataloader_num_workers=8 --loader_prefetch_size=16 --device_prefetch_size=16'
+python examples/research_projects/pytorch_xla/training/text_to_image/train_text_to_image_sdxl.py --pretrained_model_name_or_path=stabilityai/stable-diffusion-xl-base-1.0 --dataset_name=$DATASET_NAME --resolution=1024 --center_crop --random_flip --train_batch_size=$PER_HOST_BATCH_SIZE  --max_train_steps=$TRAIN_STEPS --learning_rate=1e-06 --mixed_precision=bf16 --profile_duration=80000 --output_dir=$OUTPUT_DIR --dataloader_num_workers=8 --loader_prefetch_size=16 --device_prefetch_size=16'
 ```
 
 Pass `--print_loss` if you would like to see the loss printed at every step. Be aware that printing the loss at every step disrupts the optimized flow execution, thus the step time will be longer. 
@@ -135,8 +135,10 @@ import  numpy as np
 
 import torch_xla.core.xla_model as xm
 from time import time
-from diffusers import StableDiffusionPipeline
+from diffusers import StableDiffusionXLPipeline
 import torch_xla.runtime as xr
+
+MODEL_PATH = os.environ.get("OUTPUT_DIR", None)
 
 CACHE_DIR = os.environ.get("CACHE_DIR", None)
 if CACHE_DIR:
@@ -144,12 +146,12 @@ if CACHE_DIR:
 
 def main():
     device = xm.xla_device()
-    model_path = "jffacevedo/pxla_trained_model"
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_path, 
+    pipe = StableDiffusionXLPipeline.from_pretrained(
+        MODEL_PATH, 
         torch_dtype=torch.bfloat16
     )
     pipe.to(device)
+    pipe.unet.enable_xla_flash_attention(partition_spec=("data", None, None, None))
     prompt = ["A naruto with green eyes and red legs."]
     start = time()
     print("compiling...")
@@ -168,9 +170,12 @@ if __name__ == '__main__':
 Expected Results:
 
 ```bash
+WARNING:root:libtpu.so and TPU device found. Setting PJRT_DEVICE=TPU.
+Loading pipeline components...: 100%|██████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 7/7 [00:00<00:00,  7.93it/s]
 compiling...
-100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 30/30 [10:03<00:00, 20.10s/it]
-compile time: 720.656970500946
+100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 30/30 [01:35<00:00,  3.19s/it]
+compile time: 241.23492813110352
 generate...
-100%|███████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 30/30 [00:01<00:00, 17.65it/s]
-generation time (after compile) : 1.8461642265319824
+100%|████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████████| 30/30 [00:04<00:00,  6.72it/s]
+generation time (after compile) : 5.266263246536255
+```
