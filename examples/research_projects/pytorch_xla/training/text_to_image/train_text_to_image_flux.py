@@ -21,7 +21,7 @@ from huggingface_hub import create_repo, upload_folder
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from transformers import CLIPTextModel, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
-
+from torch_xla.experimental.custom_kernel import FlashAttention
 from diffusers import (
     AutoencoderKL,
     FlowMatchEulerDiscreteScheduler,
@@ -731,7 +731,19 @@ def main(args):
 
     #unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
     transformer.enable_xla_flash_attention(partition_spec=("data", None, None, None), is_flux=True)
-
+    FlashAttention.DEFAULT_BLOCK_SIZES = {
+        "block_q": 1536,
+        "block_k_major": 1536,
+        "block_k": 1536,
+        "block_b": 1536,
+        "block_q_major_dkv": 1536,
+        "block_k_major_dkv": 1536,
+        "block_q_dkv": 1536,
+        "block_k_dkv": 1536,
+        "block_q_dq": 1536,
+        "block_k_dq": 1536,
+        "block_k_major_dq": 1536,
+    }
     # For mixed precision training we cast all non-trainable weights (vae,
     # non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full
