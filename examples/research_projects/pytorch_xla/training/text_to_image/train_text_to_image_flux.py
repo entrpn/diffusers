@@ -152,7 +152,6 @@ class TrainSD:
         for step in range(0, self.args.max_train_steps):
             print("step: ", step)
             batch = next(self.dataloader)
-            breakpoint()
             if step == measure_start_step:
                 if PROFILE_DIR is not None:
                     xm.wait_device_ops()
@@ -164,22 +163,22 @@ class TrainSD:
             def print_loss_closure(step, loss):
                 print(f"Step: {step}, Loss: {loss}")
 
-        #     if self.args.print_loss:
-        #         xm.add_step_closure(
-        #             print_loss_closure,
-        #             args=(
-        #                 self.global_step,
-        #                 loss,
-        #             ),
-        #         )
-        # xm.mark_step()
-        # if not dataloader_exception:
-        #     xm.wait_device_ops()
-        #     total_time = time.time() - last_time
-        #     print(f"Average step time: {total_time/(self.args.max_train_steps-measure_start_step)}")
-        # else:
-        #     print("dataloader exception happen, skip result")
-        #     return
+            if self.args.print_loss:
+                xm.add_step_closure(
+                    print_loss_closure,
+                    args=(
+                        self.global_step,
+                        loss,
+                    ),
+                )
+        xm.mark_step()
+        if not dataloader_exception:
+            xm.wait_device_ops()
+            total_time = time.time() - last_time
+            print(f"Average step time: {total_time/(self.args.max_train_steps-measure_start_step)}")
+        else:
+            print("dataloader exception happen, skip result")
+            return
     def get_sigmas(self, timesteps, n_dim=4, dtype=torch.float32):
         sigmas = self.noise_scheduler_copy.sigmas.to(device=self.device, dtype=dtype)
         schedule_timesteps = self.noise_scheduler_copy.timesteps.to(self.device)
@@ -306,6 +305,24 @@ def parse_args():
         default="none",
         choices=["sigma_sqrt", "logit_normal", "mode", "cosmap", "none"],
         help=('We default to the "none" weighting scheme for uniform sampling and uniform loss'),
+    )
+    parser.add_argument(
+        "--logit_mean", type=float, default=0.0, help="mean to use when using the `'logit_normal'` weighting scheme."
+    )
+    parser.add_argument(
+        "--logit_std", type=float, default=1.0, help="std to use when using the `'logit_normal'` weighting scheme."
+    )
+    parser.add_argument(
+        "--mode_scale",
+        type=float,
+        default=1.29,
+        help="Scale of mode weighting scheme. Only effective when using the `'mode'` as the `weighting_scheme`.",
+    )
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.5,
+        help="the FLUX.1 dev variant is a guidance distilled model",
     )
     parser.add_argument(
         "--revision",
@@ -793,7 +810,7 @@ def main(args):
         compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
     )
     train_dataset_with_tensors = train_dataset.map(
-        pixels_to_tensors_fn, batched=True, new_fingerprint=new_fingerprint_two, batch_size=64
+        pixels_to_tensors_fn, batched=True, new_fingerprint=new_fingerprint_two, batch_size=256
     )
     precomputed_dataset = concatenate_datasets(
         [train_dataset_with_embeddings, train_dataset_with_tensors.remove_columns(["text", "image"])], axis=1
