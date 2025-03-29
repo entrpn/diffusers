@@ -14,11 +14,15 @@
 import inspect
 import math
 from typing import Callable, List, Optional, Tuple, Union
-
+import functools
 import torch
 import torch.nn.functional as F
 from torch import nn
-
+import torch_xla.distributed.spmd as xs
+import torch_xla.core.xla_builder as xb
+from torch_xla.experimental.custom_kernel import requires_jax
+from torch_xla.distributed.spmd import Mesh
+import torch_xla.debug.profiler as xp
 from ..image_processor import IPAdapterMaskProcessor
 from ..utils import deprecate, is_torch_xla_available, logging
 from ..utils.import_utils import is_torch_npu_available, is_torch_xla_version, is_xformers_available
@@ -3332,6 +3336,100 @@ class AttnProcessor2_0:
 
         return hidden_states
 
+@requires_jax
+def maybe_convert_and_get_jax_mesh(mesh_str):
+    # Construct a JAX mesh object with the same device ids shape and ordering
+    # from torch_xla device mesh.
+    mesh = Mesh.from_str(mesh_str)
+    import jax
+    import numpy as np
+    from jax._src import mesh as mesh_lib
+
+    assert mesh.axis_names is not None, "Omitting axis names is not yet supported"
+
+    # Create a mapping from device ID to device object
+    all_devices = jax.devices()
+    device_id_to_device = {device.id: device for device in all_devices}
+    device_ids_array = mesh.device_ids.reshape(*mesh.mesh_shape)
+    device_array = np.empty(device_ids_array.shape, dtype=object)
+    for idx in np.ndindex(device_ids_array.shape):
+      device_id = device_ids_array[idx]
+      if device_id in device_id_to_device:
+        device_array[idx] = device_id_to_device[device_id]
+      else:
+        raise ValueError(
+          f"torch_xla device ID {device_id} not found in available JAX devices"
+        )
+    return mesh_lib.Mesh(device_array, axis_names=mesh.axis_names)
+
+def scaled_dot_product_attention_jax(query, key, value):
+    import jax.numpy as jnp
+    import jax
+    # from jax.experimental import shard_map
+    # mesh=maybe_convert_and_get_jax_mesh(str(xs.get_global_mesh()))
+    # axis_names = jax.sharding.PartitionSpec('data', None, None, None)
+    # def wrap_attention(query, key, value):
+    d_k = query.shape[-1]
+    scale_factor = 1.0 / jnp.sqrt(d_k)
+    attn_logits = (query @ jnp.swapaxes(key, -2, -1)) * scale_factor
+    attn_weight = jax.nn.softmax(attn_logits, axis=-1)
+    output = attn_weight @ value
+    return output
+
+    # wrapped_attention = functools.partial(
+    #     shard_map,
+    #     mesh=mesh,
+    #     in_specs=(
+    #         axis_names,
+    #         axis_names,
+    #         axis_names,
+    #     ),
+    #     out_specs=axis_names,
+    #     check_rep=False,
+    # )(wrap_attention)
+    # x = wrapped_attention(query, key, value)
+    # return x
+
+@functools.lru_cache(maxsize=16)
+def _get_jax_forward_function():
+    """Cached factory function to create JAX forward functions"""
+    return scaled_dot_product_attention_jax
+
+@functools.lru_cache(maxsize=16)
+def _get_jax_backward_function():
+    """Cached factory function to create JAX backward functions"""
+    jax_f = _get_jax_forward_function()
+    import jax
+    def jax_grad_f_wrapper(query, key, value, grad_output):
+        primals, f_vjp = jax.vjp(jax_f, query, key, value,)
+        return f_vjp(grad_output)
+    return jax_grad_f_wrapper
+
+@xp.trace_me("tpu_splash_attention_jax_call_wrapper")
+def scaled_dot_product_attention_jax_wrapper(query, key, value, grad_output=None, is_forward=True):
+    if is_forward:
+        jax_f = _get_jax_forward_function()
+        output = xb.call_jax(jax_f, [query, key, value])
+        return output
+    else:
+        jax_grad_f = _get_jax_backward_function()
+        q_grad, k_grad, v_grad = xb.call_jax(jax_grad_f, [query, key, value, grad_output])
+        return q_grad, k_grad, v_grad
+
+class JaxFun(torch.autograd.Function):
+      @staticmethod
+      def forward(ctx, query, key, value):
+        # sample_inputs = [abstractify(query), abstractify(key), abstractify(value)]
+        ctx.save_for_backward(query, key, value)
+        out = scaled_dot_product_attention_jax_wrapper(query, key, value)
+        return out
+
+      @staticmethod
+      def backward(ctx, grad_out):
+        # import pdb; pdb.set_trace()
+        query, key, value = ctx.saved_tensors
+        q_grad, k_grad, v_grad = scaled_dot_product_attention_jax_wrapper(query, key, value, grad_output=grad_out, is_forward=False)
+        return q_grad, k_grad, v_grad
 
 class XLAFlashAttnProcessor2_0:
     r"""
@@ -3348,6 +3446,20 @@ class XLAFlashAttnProcessor2_0:
         if is_spmd() and is_torch_xla_version("<", "2.4"):
             raise ImportError("SPMD support for XLA flash attention needs torch_xla version >= 2.4.")
         self.partition_spec = partition_spec
+        self.scaled_dot_product_attention_compiled = torch.compile(self.scaled_dot_product_attention, backend='openxla')
+        self.flash_attention_compiled = torch.compile(self.flash_attention, backend='openxla')
+    
+    def flash_attention(self, query, key, value):
+        p = self.partition_spec if is_spmd() else None
+        return flash_attention(query, key, value, causal=False, partition_spec=p)
+    
+    def scaled_dot_product_attention(self, query, key, value) -> torch.Tensor:
+        scale_factor = 1 / math.sqrt(query.size(-1))
+        attn_weight = query @ key.transpose(-2, -1) * scale_factor
+        attn_weight = torch.softmax(attn_weight, dim=-1)
+        return attn_weight @ value
+        # out = xb.call_jax(scaled_dot_product_attention_jax, (query, key, value))
+        # return out
 
     def __call__(
         self,
@@ -3407,7 +3519,7 @@ class XLAFlashAttnProcessor2_0:
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        if all(tensor.shape[2] >= 4096 for tensor in [query, key, value]):
+        if all(tensor.shape[2] >= 1024 for tensor in [query, key, value]):
             if attention_mask is not None:
                 attention_mask = attention_mask.view(batch_size, 1, 1, attention_mask.shape[-1])
                 # Convert mask to float and replace 0s with -inf and 1s with 0
@@ -3420,15 +3532,15 @@ class XLAFlashAttnProcessor2_0:
                 # Apply attention mask to key
                 key = key + attention_mask
             query /= math.sqrt(query.shape[3])
-            partition_spec = self.partition_spec if is_spmd() else None
-            hidden_states = flash_attention(query, key, value, causal=False, partition_spec=partition_spec)
+            hidden_states = self.flash_attention(query, key, value)
         else:
-            logger.warning(
-                "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
-            )
-            hidden_states = F.scaled_dot_product_attention(
-                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
-            )
+            # logger.warning(
+            #     "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
+            # )
+            # hidden_states = self.scaled_dot_product_attention(
+            #     query, key, value
+            # )
+            hidden_states = JaxFun.apply(query, key, value)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)
