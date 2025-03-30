@@ -3390,12 +3390,12 @@ def scaled_dot_product_attention_jax(query, key, value):
     # x = wrapped_attention(query, key, value)
     # return x
 
-@functools.lru_cache(maxsize=16)
+@functools.lru_cache(maxsize=256)
 def _get_jax_forward_function():
     """Cached factory function to create JAX forward functions"""
     return scaled_dot_product_attention_jax
 
-@functools.lru_cache(maxsize=16)
+@functools.lru_cache(maxsize=256)
 def _get_jax_backward_function():
     """Cached factory function to create JAX backward functions"""
     jax_f = _get_jax_forward_function()
@@ -3419,14 +3419,12 @@ def scaled_dot_product_attention_jax_wrapper(query, key, value, grad_output=None
 class JaxFun(torch.autograd.Function):
       @staticmethod
       def forward(ctx, query, key, value):
-        # sample_inputs = [abstractify(query), abstractify(key), abstractify(value)]
         ctx.save_for_backward(query, key, value)
         out = scaled_dot_product_attention_jax_wrapper(query, key, value)
         return out
 
       @staticmethod
       def backward(ctx, grad_out):
-        # import pdb; pdb.set_trace()
         query, key, value = ctx.saved_tensors
         q_grad, k_grad, v_grad = scaled_dot_product_attention_jax_wrapper(query, key, value, grad_output=grad_out, is_forward=False)
         return q_grad, k_grad, v_grad
@@ -3453,6 +3451,7 @@ class XLAFlashAttnProcessor2_0:
         p = self.partition_spec if is_spmd() else None
         return flash_attention(query, key, value, causal=False, partition_spec=p)
     
+    @xp.trace_me("scaled_dot_product_attention")
     def scaled_dot_product_attention(self, query, key, value) -> torch.Tensor:
         scale_factor = 1 / math.sqrt(query.size(-1))
         attn_weight = query @ key.transpose(-2, -1) * scale_factor
@@ -3537,10 +3536,10 @@ class XLAFlashAttnProcessor2_0:
             # logger.warning(
             #     "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
             # )
-            # hidden_states = self.scaled_dot_product_attention(
-            #     query, key, value
-            # )
-            hidden_states = JaxFun.apply(query, key, value)
+            hidden_states = self.scaled_dot_product_attention(
+                query, key, value
+            )
+            # hidden_states = JaxFun.apply(query, key, value)
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
         hidden_states = hidden_states.to(query.dtype)

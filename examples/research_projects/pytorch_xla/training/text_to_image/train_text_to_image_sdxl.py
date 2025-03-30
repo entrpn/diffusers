@@ -21,8 +21,13 @@ from huggingface_hub import create_repo, upload_folder
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
+from transformers.trainer_pt_utils import get_module_class_from_name
 from viztracer import VizTracer
 
+from torch._dispatch.python import suspend_functionalization
+from torch._subclasses.functional_tensor import disable_functional_mode
+
+from torch_xla.distributed.fsdp import checkpoint_module
 from diffusers import (
     AutoencoderKL,
     DDPMScheduler,
@@ -118,6 +123,35 @@ These are the key hyperparameters used during training:
     model_card.save(os.path.join(repo_folder, "README.md"))
 
 
+def wrap_module(
+    mod: torch.nn.Module, transform, prefix: tuple[str, ...] = tuple()
+) -> torch.nn.Module:
+    """
+    Recursively transforms the modules by calling `transform` on them.
+
+    You may use this to apply sharding, checkpointing, optimization barriers, etc.
+
+    Start from the leaf modules and work our way up, to handle cases where one
+    module is the child of another. The child modules will be transformed first,
+    and then the parent module will be transformed, possibly with transformed
+    children.
+    """
+    new_children = {}
+    for name, child in mod.named_children():
+        new_children[name] = wrap_module(child, transform, prefix + (name,))
+    for name, new_child in new_children.items():
+        mod.set_submodule(name, new_child)
+    return transform(mod)
+
+def add_checkpoints(model):
+    remat_classes = [get_module_class_from_name(model, "BasicTransformerBlock")]
+    import pdb; pdb.set_trace()
+    def maybe_checkpoint(mod):
+        if isinstance(mod, tuple(remat_classes)):
+            return checkpoint_module(mod)
+        return mod
+    return wrap_module(model, maybe_checkpoint)
+
 class TrainSD:
     def __init__(
         self,
@@ -163,13 +197,14 @@ class TrainSD:
                 tracer = VizTracer()
             else:
                 tracer = None
-            loss = self.step_fn(
-                tracer,
-                batch["model_input"],
-                batch["prompt_embeds"],
-                batch["pooled_prompt_embeds"],
-                batch["original_sizes"],
-                batch["crop_top_lefts"])
+            with suspend_functionalization(), disable_functional_mode():
+                loss = self.step_fn(
+                    tracer,
+                    batch["model_input"],
+                    batch["prompt_embeds"],
+                    batch["pooled_prompt_embeds"],
+                    batch["original_sizes"],
+                    batch["crop_top_lefts"])
             self.global_step += 1
 
             def print_loss_closure(step, loss):
@@ -647,9 +682,9 @@ def main(args):
       use_fast=False
     )
 
-    from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear
+    # from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear
 
-    unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
+    # unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
     unet.enable_xla_flash_attention(partition_spec=("data", None, None, None))
 
     vae.requires_grad_(False)
@@ -810,6 +845,8 @@ def main(args):
             f"Total train batch size (w. parallel, distributed & accumulation) = {args.train_batch_size * num_hosts}"
         )
         print(f"  Total optimization steps = {args.max_train_steps}")
+    
+    unet = add_checkpoints(unet)
 
     trainer = TrainSD(
         weight_dtype=weight_dtype,
