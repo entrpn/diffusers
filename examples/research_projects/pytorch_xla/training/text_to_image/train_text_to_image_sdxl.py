@@ -22,7 +22,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
 from transformers.trainer_pt_utils import get_module_class_from_name
-from viztracer import VizTracer
+# from viztracer import VizTracer
 
 from torch._dispatch.python import suspend_functionalization
 from torch._subclasses.functional_tensor import disable_functional_mode
@@ -145,7 +145,7 @@ def wrap_module(
 
 def add_checkpoints(model):
     remat_classes = [get_module_class_from_name(model, "BasicTransformerBlock")]
-    import pdb; pdb.set_trace()
+    # import pdb; pdb.set_trace()
     def maybe_checkpoint(mod):
         if isinstance(mod, tuple(remat_classes)):
             return checkpoint_module(mod)
@@ -172,6 +172,7 @@ class TrainSD:
         self.mesh = xs.get_global_mesh()
         self.dataloader = iter(dataloader)
         self.global_step = 0
+        # self.step_fn_compiled = torch.compile(self.step_fn, backend="openxla")
 
     def run_optimizer(self):
         self.optimizer.step()
@@ -184,7 +185,6 @@ class TrainSD:
         assert measure_start_step < self.args.max_train_steps
         total_time = 0
         last_time = time.time()
-        tracer = None
         for step in range(0, self.args.max_train_steps):
             print("step: ", step)
             start_time = time.time()
@@ -193,13 +193,9 @@ class TrainSD:
             if step == measure_start_step and PROFILE_DIR is not None:
                 xm.wait_device_ops()
                 xp.trace_detached(f"localhost:{PORT}", PROFILE_DIR, duration_ms=args.profile_duration)
-            if step == 15:
-                tracer = VizTracer()
-            else:
-                tracer = None
+            
             with suspend_functionalization(), disable_functional_mode():
                 loss = self.step_fn(
-                    tracer,
                     batch["model_input"],
                     batch["prompt_embeds"],
                     batch["pooled_prompt_embeds"],
@@ -229,107 +225,91 @@ class TrainSD:
 
     def step_fn(
         self,
-        tracer,
         model_input,
         prompt_embeds,
         pooled_prompt_embeds,
         original_sizes,
         crop_top_lefts
     ):
-        # with VizTracer(output_file="forward.json") as tracer:
         start_time = time.time()
-        if tracer is not None:
-            tracer.start()
-        self.optimizer.zero_grad()
-        noise = torch.randn_like(model_input).to(self.device, dtype=self.weight_dtype)
-        bsz = model_input.shape[0]
-        timesteps = torch.randint(
-            0,
-            self.noise_scheduler.config.num_train_timesteps,
-            (bsz,),
-            device=model_input.device,
-        )
-        timesteps = timesteps.long()
-        noisy_latents = self.noise_scheduler.add_noise(model_input, noise, timesteps)
-        noisy_latents = noisy_latents.to(self.device, dtype=self.weight_dtype)
-        # time ids
-        def compute_time_ids(original_size, crops_coords_top_left):
-            # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
-            target_size = torch.tensor([self.args.resolution, self.args.resolution]).to(self.device)
-            add_time_ids = torch.unsqueeze(torch.cat([original_size, crops_coords_top_left, target_size], axis=0), dim=0)
-            return add_time_ids
+        with xp.Trace("optimizer_zero_grad"):
+            self.optimizer.zero_grad(True)
+        with xp.Trace("forward"):
+            noise = torch.randn_like(model_input).to(self.device, dtype=self.weight_dtype)
+            bsz = model_input.shape[0]
+            timesteps = torch.randint(
+                0,
+                self.noise_scheduler.config.num_train_timesteps,
+                (bsz,),
+                device=model_input.device,
+            )
+            timesteps = timesteps.long()
+            noisy_latents = self.noise_scheduler.add_noise(model_input, noise, timesteps)
+            noisy_latents = noisy_latents.to(self.device, dtype=self.weight_dtype)
+            # time ids
+            def compute_time_ids(original_size, crops_coords_top_left):
+                # Adapted from pipeline.StableDiffusionXLPipeline._get_add_time_ids
+                target_size = torch.tensor([self.args.resolution, self.args.resolution]).to(self.device)
+                add_time_ids = torch.unsqueeze(torch.cat([original_size, crops_coords_top_left, target_size], axis=0), dim=0)
+                return add_time_ids
 
-        add_time_ids = torch.cat(
-            [compute_time_ids(s, c) for s, c in zip(original_sizes, crop_top_lefts)]
-        )
-        # Predict the noise residual
-        unet_added_conditions = {"time_ids": add_time_ids}
-        unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
-        # breakpoint()
-        model_pred = self.unet(
-            noisy_latents,
-            timesteps,
-            prompt_embeds,
-            added_cond_kwargs=unet_added_conditions,
-            return_dict=False,
-        )[0]
-        if self.args.prediction_type is not None:
-            # set prediction_type of scheduler if defined
-            self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
-        if self.noise_scheduler.config.prediction_type == "epsilon":
-            target = noise
-        elif self.noise_scheduler.config.prediction_type == "v_prediction":
-            target = self.noise_scheduler.get_velocity(model_input, noise, timesteps)
-        elif self.noise_scheduler.config.prediction_type == "sample":
-            # We set the target to latents here, but the model_pred will return the noise sample prediction.
-            target = model_input
-            # We will have to subtract the noise residual from the prediction to get the target sample.
-            model_pred = model_pred - noise
-        else:
-            raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
+            add_time_ids = torch.cat(
+                [compute_time_ids(s, c) for s, c in zip(original_sizes, crop_top_lefts)]
+            )
+            # Predict the noise residual
+            unet_added_conditions = {"time_ids": add_time_ids}
+            unet_added_conditions.update({"text_embeds": pooled_prompt_embeds})
+            # breakpoint()
+            model_pred = self.unet(
+                noisy_latents,
+                timesteps,
+                prompt_embeds,
+                added_cond_kwargs=unet_added_conditions,
+                return_dict=False,
+            )[0]
+            if self.args.prediction_type is not None:
+                # set prediction_type of scheduler if defined
+                self.noise_scheduler.register_to_config(prediction_type=self.args.prediction_type)
+            if self.noise_scheduler.config.prediction_type == "epsilon":
+                target = noise
+            elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                target = self.noise_scheduler.get_velocity(model_input, noise, timesteps)
+            elif self.noise_scheduler.config.prediction_type == "sample":
+                # We set the target to latents here, but the model_pred will return the noise sample prediction.
+                target = model_input
+                # We will have to subtract the noise residual from the prediction to get the target sample.
+                model_pred = model_pred - noise
+            else:
+                raise ValueError(f"Unknown prediction type {self.noise_scheduler.config.prediction_type}")
 
-        if tracer:
-            tracer.stop()
-            tracer.save(output_file="forward.json")
         print(f"forward_time = {time.time()-start_time}")
         start_time = time.time()
-        # with VizTracer(output_file="backward.json") as tracer:
+        with xp.Trace("backward"):
+            if self.args.snr_gamma is None:
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+            else:
+                # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
+                # Since we predict the noise instead of x_0, the original formulation is slightly changed.
+                # This is discussed in Section 4.2 of the same paper.
+                snr = compute_snr(self.noise_scheduler, timesteps)
+                mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
+                    dim=1
+                )[0]
+                if self.noise_scheduler.config.prediction_type == "epsilon":
+                    mse_loss_weights = mse_loss_weights / snr
+                elif self.noise_scheduler.config.prediction_type == "v_prediction":
+                    mse_loss_weights = mse_loss_weights / (snr + 1)
 
-        if tracer:
-            tracer.start()
-        if self.args.snr_gamma is None:
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-        else:
-            # Compute loss-weights as per Section 3.4 of https://arxiv.org/abs/2303.09556.
-            # Since we predict the noise instead of x_0, the original formulation is slightly changed.
-            # This is discussed in Section 4.2 of the same paper.
-            snr = compute_snr(self.noise_scheduler, timesteps)
-            mse_loss_weights = torch.stack([snr, self.args.snr_gamma * torch.ones_like(timesteps)], dim=1).min(
-                dim=1
-            )[0]
-            if self.noise_scheduler.config.prediction_type == "epsilon":
-                mse_loss_weights = mse_loss_weights / snr
-            elif self.noise_scheduler.config.prediction_type == "v_prediction":
-                mse_loss_weights = mse_loss_weights / (snr + 1)
-
-            loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
-            loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
-            loss = loss.mean()
-        loss.backward()
-        if tracer:
-            tracer.stop()
-            tracer.save(output_file="backward.json")
+                loss = F.mse_loss(model_pred.float(), target.float(), reduction="none")
+                loss = loss.mean(dim=list(range(1, len(loss.shape)))) * mse_loss_weights
+                loss = loss.mean()
+            loss.backward()
         print(f"backward time = {time.time()-start_time}")
         start_time = time.time()
-        # with xp.Trace("optimizer_step"):
-        if tracer:
-            tracer.start()
-        self.run_optimizer()
-        if tracer:
-            tracer.stop()
-            tracer.save(output_file="optimizer.json")
+        with xp.Trace("optimizer_step"):
+            self.run_optimizer()
         print(f"optimizer step = {time.time()-start_time}")
-        return loss
+        return model_pred
 
 
 def parse_args():
@@ -567,7 +547,12 @@ def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, ca
             prompt_embeds = prompt_embeds.view(bs_embed, seq_len, -1)
             prompt_embeds_list.append(prompt_embeds)
 
+    
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1).to(dtype=dtype)
+    print(prompt_embeds.shape)
+    p3d = (0,0, 0, 128-77)
+    prompt_embeds = F.pad(prompt_embeds, p3d, "constant", 0)
+    print(prompt_embeds.shape)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1).to(dtype=dtype)
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
@@ -580,7 +565,8 @@ def compute_vae_encodings(batch, vae):
     with torch.no_grad():
         model_input = vae.encode(pixel_values).latent_dist.sample()
     model_input = model_input * vae.config.scaling_factor
-    return {"model_input": model_input}
+    xm.mark_step()
+    return {"model_input": model_input.cpu()}
 
 
 def load_dataset(args):
@@ -770,16 +756,20 @@ def main(args):
     )
     compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
     from datasets.fingerprint import Hasher
-
+    # import pdb; pdb.set_trace()
+    old_batch_size = args.train_batch_size
+    args.train_batch_size=21
     new_fingerprint = Hasher.hash(args)
+    args.train_batch_size=64
     new_fingerprint_for_vae = Hasher.hash((args.pretrained_model_name_or_path, args))
+    args.train_batch_size=old_batch_size
     train_dataset_with_embeddings = train_dataset.map(
-        compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
+        compute_embeddings_fn, batched=True, batch_size=50, new_fingerprint=new_fingerprint
     )
     train_dataset_with_vae = train_dataset.map(
         compute_vae_encodings_fn,
         batched=True,
-        batch_size=args.train_batch_size,
+        batch_size=50,
         new_fingerprint=new_fingerprint_for_vae,
     )
     precomputed_dataset = concatenate_datasets(
@@ -794,14 +784,6 @@ def main(args):
         crop_top_lefts = torch.stack([torch.tensor(example["crop_top_lefts"]) for example in examples])
         prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
         pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
-        # print("model_input.shape: ", model_input.shape)
-        # print("model_input.dtype: ", model_input.dtype)
-        # print("prompt_embeds.shape: ", prompt_embeds.shape)
-        # print("prompt_embeds.dtype: ", prompt_embeds.dtype)
-        # print("pooled_prompt_embeds.shape: ", pooled_prompt_embeds.shape)
-        # print("pooled_prompt_embeds.dtype: ", pooled_prompt_embeds.dtype)
-        # print("original_sizes.shape: ", original_sizes.shape)
-        # print("crop_top_lefts.shape: ", crop_top_lefts.shape)
         return {
           "model_input": model_input,
           "prompt_embeds": prompt_embeds,
@@ -846,7 +828,7 @@ def main(args):
         )
         print(f"  Total optimization steps = {args.max_train_steps}")
     
-    unet = add_checkpoints(unet)
+    # unet = add_checkpoints(unet)
 
     trainer = TrainSD(
         weight_dtype=weight_dtype,
