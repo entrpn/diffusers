@@ -121,8 +121,8 @@ class TrainSD:
         weight_dtype,
         device,
         noise_scheduler,
+        vae_scale_factor,
         transformer,
-        vae,
         optimizer,
         dataloader,
         args,
@@ -131,13 +131,13 @@ class TrainSD:
         self.device = device
         self.noise_scheduler = noise_scheduler
         self.transformer = transformer
-        self.vae = vae
         self.optimizer = optimizer
         self.args = args
         self.mesh = xs.get_global_mesh()
         self.dataloader = iter(dataloader)
         self.global_step = 0
         self.noise_scheduler_copy = copy.deepcopy(noise_scheduler)
+        self.vae_scale_factor = vae_scale_factor
 
     def run_optimizer(self):
         self.optimizer.step()
@@ -198,13 +198,7 @@ class TrainSD:
             prompt_embeds = batch["prompt_embeds"]
             pooled_prompt_embeds = batch["pooled_prompt_embeds"]
             text_ids = batch["text_ids"]
-            
-            pixel_tensor_values = batch["pixel_tensor_values"]
-            model_input = self.vae.encode(pixel_tensor_values).latent_dist.sample()
-            model_input = (model_input - self.vae.config.shift_factor) * self.vae.config.scaling_factor
-            model_input = model_input.to(dtype=self.weight_dtype)
-
-            vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+            model_input = batch["model_input"]
 
             latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                 model_input.shape[0],
@@ -264,9 +258,9 @@ class TrainSD:
             # upscaling height & width as discussed in https://github.com/huggingface/diffusers/pull/9257#discussion_r1731108042
             model_pred = FluxPipeline._unpack_latents(
                 model_pred,
-                height=model_input.shape[2] * vae_scale_factor,
-                width=model_input.shape[3] * vae_scale_factor,
-                vae_scale_factor=vae_scale_factor,
+                height=model_input.shape[2] * self.vae_scale_factor,
+                width=model_input.shape[3] * self.vae_scale_factor,
+                vae_scale_factor=self.vae_scale_factor,
             )
 
             # these weighting schemes use a uniform timestep sampling
@@ -626,6 +620,17 @@ def encode_prompt(
 
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds, "text_ids" : text_ids}
 
+def compute_vae_encodings(batch, vae, device, dtype):
+    images = batch.pop("pixel_values")
+    pixel_values = torch.stack(list(images))
+    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
+    pixel_values = pixel_values.to(vae.device, dtype=vae.dtype)
+
+    with torch.no_grad():
+        model_input = vae.encode(pixel_values).latent_dist.sample()
+    model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
+    return {"model_input": model_input}
+
 def pixels_to_tensors(batch, device, dtype):
     images = batch.pop("pixel_values")
     pixel_values = torch.stack(list(images))
@@ -729,20 +734,20 @@ def main(args):
 
     from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear
 
-    #unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
+    #transformer = apply_xla_patch_to_nn_linear(transformer, xs.xla_patched_nn_linear_forward)
     transformer.enable_xla_flash_attention(partition_spec=("data", None, None, None), is_flux=True)
     FlashAttention.DEFAULT_BLOCK_SIZES = {
-        "block_q": 1536,
-        "block_k_major": 1536,
-        "block_k": 1536,
-        "block_b": 1536,
-        "block_q_major_dkv": 1536,
-        "block_k_major_dkv": 1536,
-        "block_q_dkv": 1536,
-        "block_k_dkv": 1536,
-        "block_q_dq": 1536,
-        "block_k_dq": 1536,
-        "block_k_major_dq": 1536,
+        "block_q": 512,
+        "block_k_major": 512,
+        "block_k": 512,
+        "block_b": 512,
+        "block_q_major_dkv": 512,
+        "block_k_major_dkv": 512,
+        "block_q_dkv": 512,
+        "block_k_dkv": 512,
+        "block_q_dq": 512,
+        "block_k_dq": 768,
+        "block_k_major_dq": 512,
     }
     # For mixed precision training we cast all non-trainable weights (vae,
     # non-lora text_encoder and non-lora unet) to half-precision
@@ -812,8 +817,7 @@ def main(args):
       tokenizers=tokenizers,
       caption_column=caption_column,
     )
-    #compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
-    pixels_to_tensors_fn = functools.partial(pixels_to_tensors, device=device, dtype=weight_dtype)
+    compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae, device=device, dtype=weight_dtype)
     from datasets.fingerprint import Hasher
 
     new_fingerprint = Hasher.hash(args)
@@ -822,24 +826,25 @@ def main(args):
         compute_embeddings_fn, batched=True, new_fingerprint=new_fingerprint
     )
     train_dataset_with_tensors = train_dataset.map(
-        pixels_to_tensors_fn, batched=True, new_fingerprint=new_fingerprint_two, batch_size=256
+        compute_vae_encodings_fn, batched=True, new_fingerprint=new_fingerprint_two, batch_size=8
     )
     precomputed_dataset = concatenate_datasets(
         [train_dataset_with_embeddings, train_dataset_with_tensors.remove_columns(["text", "image"])], axis=1
     )
     precomputed_dataset = precomputed_dataset.with_transform(preprocess_train)
-    del compute_embeddings_fn, text_encoder, text_encoder_2
+    vae_scale_factor = 2 ** (len(vae.config.block_out_channels) - 1)
+    del compute_embeddings_fn, text_encoder, text_encoder_2, vae
     del text_encoders, tokenizers
     def collate_fn(examples):
         prompt_embeds = torch.stack([torch.tensor(example["prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
         pooled_prompt_embeds = torch.stack([torch.tensor(example["pooled_prompt_embeds"]) for example in examples]).to(dtype=weight_dtype)
         text_ids = torch.stack([torch.tensor(example["text_ids"]) for example in examples]).to(dtype=weight_dtype)
-        pixel_tensor_values = torch.stack([torch.tensor(example["pixel_tensor_values"]) for example in examples]).to(dtype=weight_dtype)
+        model_input = torch.stack([torch.tensor(example["model_input"]) for example in examples]).to(dtype=weight_dtype)
         return {
           "prompt_embeds": prompt_embeds,
           "pooled_prompt_embeds": pooled_prompt_embeds,
           "text_ids" : text_ids,
-          "pixel_tensor_values" : pixel_tensor_values
+          "model_input" : model_input,
         }
 
     g = torch.Generator()
@@ -860,7 +865,7 @@ def main(args):
         input_sharding={
             "prompt_embeds" : xs.ShardingSpec(mesh, ("data", None, None), minibatch=True),
             "pooled_prompt_embeds" : xs.ShardingSpec(mesh, ("data", None,), minibatch=True),
-            "pixel_tensor_values" : xs.ShardingSpec(mesh, ("data", None, None, None), minibatch=True),
+            "model_input" : xs.ShardingSpec(mesh, ("data", None, None, None), minibatch=True),
             "text_ids" : xs.ShardingSpec(mesh, ("data", None, None), minibatch=True),
         },
         loader_prefetch_size=args.loader_prefetch_size,
@@ -881,8 +886,8 @@ def main(args):
         weight_dtype=weight_dtype,
         device=device,
         noise_scheduler=noise_scheduler,
+        vae_scale_factor=vae_scale_factor,
         transformer=transformer,
-        vae=vae,
         optimizer=optimizer,
         dataloader=train_dataloader,
         args=args,
