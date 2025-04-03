@@ -829,7 +829,7 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
     
     # unet = add_checkpoints(unet)
-
+    # import pdb; pdb.set_trace()
     trainer = TrainSD(
         weight_dtype=weight_dtype,
         device=device,

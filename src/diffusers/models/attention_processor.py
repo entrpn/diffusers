@@ -3510,7 +3510,7 @@ class XLAFlashAttnProcessor2_0:
         # if attn.group_norm is not None:
         #     hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
 
-        
+        # batch_size = hidden_states.shape[0]
         
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
@@ -3528,10 +3528,10 @@ class XLAFlashAttnProcessor2_0:
 
         key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
         value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
-
+        """
         assert attn.norm_q is None
         assert attn.norm_k is None
-        """
+
         # if attn.norm_q is not None:
         #     query = attn.norm_q(query)
         # if attn.norm_k is not None:
@@ -3557,26 +3557,27 @@ class XLAFlashAttnProcessor2_0:
         #     # logger.warning(
         #     #     "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
         #     # )
-        #     hidden_states = self.scaled_dot_product_attention_compiled(
-        #         query, key, value
-        #     )
+        # hidden_states = self.scaled_dot_product_attention(
+        #     query, key, value
+        # )
         
         #*hidden_states = JaxFun.apply(query, key, value)
+        import pdb; pdb.set_trace()
         hidden_states = JaxFun.apply(hidden_states, encoder_hidden_states, attn.to_q.weight, attn.to_k.weight, attn.to_v.weight, attn.heads)
         hidden_states = hidden_states.to(input_dtype)
 
         # linear proj
         hidden_states = attn.to_out[0](hidden_states)
         # dropout
-        hidden_states = attn.to_out[1](hidden_states)
+        # hidden_states = attn.to_out[1](hidden_states)
 
         # if input_ndim == 4:
         #     hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
 
-        if attn.residual_connection:
-            hidden_states = hidden_states + residual
+        # if attn.residual_connection:
+        #     hidden_states = hidden_states + residual
 
-        hidden_states = hidden_states / attn.rescale_output_factor
+        # hidden_states = hidden_states / attn.rescale_output_factor
 
         return hidden_states
 
