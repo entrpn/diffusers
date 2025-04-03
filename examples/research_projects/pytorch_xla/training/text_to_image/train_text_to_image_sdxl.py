@@ -549,10 +549,6 @@ def encode_prompt(batch, text_encoders, tokenizers, proportion_empty_prompts, ca
 
     
     prompt_embeds = torch.concat(prompt_embeds_list, dim=-1).to(dtype=dtype)
-    print(prompt_embeds.shape)
-    p3d = (0,0, 0, 128-77)
-    prompt_embeds = F.pad(prompt_embeds, p3d, "constant", 0)
-    print(prompt_embeds.shape)
     pooled_prompt_embeds = pooled_prompt_embeds.view(bs_embed, -1).to(dtype=dtype)
     return {"prompt_embeds": prompt_embeds, "pooled_prompt_embeds": pooled_prompt_embeds}
 
@@ -667,11 +663,7 @@ def main(args):
       revision=args.revision,
       use_fast=False
     )
-
-    # from torch_xla.distributed.fsdp.utils import apply_xla_patch_to_nn_linear
-
-    # unet = apply_xla_patch_to_nn_linear(unet, xs.xla_patched_nn_linear_forward)
-    unet.enable_xla_flash_attention(partition_spec=("data", None, None, None))
+    unet.enable_xla_attention(partition_spec=("data", None, None, None))
 
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
@@ -758,11 +750,14 @@ def main(args):
     from datasets.fingerprint import Hasher
     # import pdb; pdb.set_trace()
     old_batch_size = args.train_batch_size
-    args.train_batch_size=21
+    old_arg = args.output_dir
+    args.output_dir = '/tmp/trained-model/'
+    args.train_batch_size=22
     new_fingerprint = Hasher.hash(args)
     args.train_batch_size=64
     new_fingerprint_for_vae = Hasher.hash((args.pretrained_model_name_or_path, args))
     args.train_batch_size=old_batch_size
+    args.output_dir = old_arg
     train_dataset_with_embeddings = train_dataset.map(
         compute_embeddings_fn, batched=True, batch_size=50, new_fingerprint=new_fingerprint
     )
@@ -829,7 +824,6 @@ def main(args):
         print(f"  Total optimization steps = {args.max_train_steps}")
     
     # unet = add_checkpoints(unet)
-    # import pdb; pdb.set_trace()
     trainer = TrainSD(
         weight_dtype=weight_dtype,
         device=device,
@@ -840,19 +834,15 @@ def main(args):
         args=args,
     )
     trainer.start_training()
-    # unet = trainer.unet.to("cpu")
-    # vae = trainer.vae.to("cpu")
-    # text_encoder = trainer.text_encoder.to("cpu")
+    unet = trainer.unet.to("cpu")
 
-    # pipeline = StableDiffusionXLPipeline.from_pretrained(
-    #     args.pretrained_model_name_or_path,
-    #     text_encoder=text_encoder,
-    #     vae=vae,
-    #     unet=unet,
-    #     revision=args.revision,
-    #     variant=args.variant,
-    # )
-    # pipeline.save_pretrained(args.output_dir)
+    pipeline = StableDiffusionXLPipeline.from_pretrained(
+        args.pretrained_model_name_or_path,
+        unet=unet,
+        revision=args.revision,
+        variant=args.variant,
+    )
+    pipeline.save_pretrained(args.output_dir)
 
     # if xm.is_master_ordinal() and args.push_to_hub:
     #     save_model_card(args, repo_id, repo_folder=args.output_dir)

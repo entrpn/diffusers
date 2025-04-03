@@ -307,7 +307,7 @@ class Attention(nn.Module):
             )
         self.set_processor(processor)
 
-    def set_use_xla_flash_attention(
+    def set_use_xla_attention(
         self,
         use_xla_flash_attention: bool,
         partition_spec: Optional[Tuple[Optional[str], ...]] = None,
@@ -336,7 +336,7 @@ class Attention(nn.Module):
                     processor = XLAFlashAttnProcessor2_0(partition_spec)
         else:
             processor = (
-                AttnProcessor2_0() if hasattr(F, "scaled_dot_product_attention") and self.scale_qk else AttnProcessor()
+                XLADotAttnProcessor(partition_spec=partition_spec)
             )
         self.set_processor(processor)
 
@@ -3333,7 +3333,6 @@ class AttnProcessor2_0:
 
         return hidden_states
 
-
 class XLAFlashAttnProcessor2_0:
     r"""
     Processor for implementing scaled dot-product attention with pallas flash attention kernel if using `torch_xla`.
@@ -3360,18 +3359,114 @@ class XLAFlashAttnProcessor2_0:
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        residual = hidden_states
+        if attn.spatial_norm is not None:
+            hidden_states = attn.spatial_norm(hidden_states, temb)
+
         input_ndim = hidden_states.ndim
-        assert input_ndim != 4
-        input_dtype = hidden_states.dtype
-        assert attention_mask is None
+
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
+
+        batch_size, sequence_length, _ = (
+            hidden_states.shape if encoder_hidden_states is None else encoder_hidden_states.shape
+        )
+
+        if attention_mask is not None:
+            attention_mask = attn.prepare_attention_mask(attention_mask, sequence_length, batch_size)
+            # scaled_dot_product_attention expects attention_mask shape to be
+            # (batch, heads, source_length, target_length)
+            attention_mask = attention_mask.view(batch_size, attn.heads, -1, attention_mask.shape[-1])
+
+        if attn.group_norm is not None:
+            hidden_states = attn.group_norm(hidden_states.transpose(1, 2)).transpose(1, 2)
+
+        query = attn.to_q(hidden_states)
+
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         elif attn.norm_cross:
             encoder_hidden_states = attn.norm_encoder_hidden_states(encoder_hidden_states)
-        assert attn.norm_q is None
-        assert attn.norm_k is None
+
+        key = attn.to_k(encoder_hidden_states)
+        value = attn.to_v(encoder_hidden_states)
+
+        inner_dim = key.shape[-1]
+        head_dim = inner_dim // attn.heads
+
+        query = query.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        key = key.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+        value = value.view(batch_size, -1, attn.heads, head_dim).transpose(1, 2)
+
+        if attn.norm_q is not None:
+            query = attn.norm_q(query)
+        if attn.norm_k is not None:
+            key = attn.norm_k(key)
+
+        # the output of sdp = (batch, num_heads, seq_len, head_dim)
+        # TODO: add support for attn.scale when we move to Torch 2.1
+        if all(tensor.shape[2] >= 4096 for tensor in [query, key, value]):
+            if attention_mask is not None:
+                attention_mask = attention_mask.view(batch_size, 1, 1, attention_mask.shape[-1])
+                # Convert mask to float and replace 0s with -inf and 1s with 0
+                attention_mask = (
+                    attention_mask.float()
+                    .masked_fill(attention_mask == 0, float("-inf"))
+                    .masked_fill(attention_mask == 1, float(0.0))
+                )
+
+                # Apply attention mask to key
+                key = key + attention_mask
+            query /= math.sqrt(query.shape[3])
+            partition_spec = self.partition_spec if is_spmd() else None
+            hidden_states = flash_attention(query, key, value, causal=False, partition_spec=partition_spec)
+        else:
+            logger.warning(
+                "Unable to use the flash attention pallas kernel API call due to QKV sequence length < 4096."
+            )
+            hidden_states = F.scaled_dot_product_attention(
+                query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+            )
+
+        hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
+        hidden_states = hidden_states.to(query.dtype)
+
+        # linear proj
+        hidden_states = attn.to_out[0](hidden_states)
+        # dropout
+        hidden_states = attn.to_out[1](hidden_states)
+
+        if input_ndim == 4:
+            hidden_states = hidden_states.transpose(-1, -2).reshape(batch_size, channel, height, width)
+
+        if attn.residual_connection:
+            hidden_states = hidden_states + residual
+
+        hidden_states = hidden_states / attn.rescale_output_factor
+
+        return hidden_states
+
+class XLADotAttnProcessor:
+    r"""
+    Processor for implementing scaled dot-product attention using `torch_xla`.
+    """
+
+    def __init__(self, partition_spec: Optional[Tuple[Optional[str], ...]] = None):
+        self.partition_spec = partition_spec
+
+    def __call__(
+        self,
+        attn: Attention,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
+        if encoder_hidden_states is None:
+            encoder_hidden_states = hidden_states
         hidden_states = CrossAttention.apply(hidden_states, encoder_hidden_states, attn.to_q.weight, attn.to_k.weight, attn.to_v.weight, attn.heads)
-        hidden_states = hidden_states.to(input_dtype)
         hidden_states = attn.to_out[0](hidden_states)
         return hidden_states
 
