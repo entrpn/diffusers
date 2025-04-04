@@ -206,7 +206,7 @@ class TrainSD:
             def print_loss_closure(step, loss):
                 print(f"Step: {step}, Loss: {loss}")
 
-            if self.args.print_loss:
+            if True:
                 xm.add_step_closure(
                     print_loss_closure,
                     args=(
@@ -748,16 +748,8 @@ def main(args):
     )
     compute_vae_encodings_fn = functools.partial(compute_vae_encodings, vae=vae)
     from datasets.fingerprint import Hasher
-    # import pdb; pdb.set_trace()
-    old_batch_size = args.train_batch_size
-    old_arg = args.output_dir
-    args.output_dir = '/tmp/trained-model/'
-    args.train_batch_size=22
     new_fingerprint = Hasher.hash(args)
-    args.train_batch_size=64
     new_fingerprint_for_vae = Hasher.hash((args.pretrained_model_name_or_path, args))
-    args.train_batch_size=old_batch_size
-    args.output_dir = old_arg
     train_dataset_with_embeddings = train_dataset.map(
         compute_embeddings_fn, batched=True, batch_size=50, new_fingerprint=new_fingerprint
     )
