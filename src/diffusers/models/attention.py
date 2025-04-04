@@ -16,7 +16,6 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 from torch import nn
-import torch_xla.debug.profiler as xp
 
 from ..utils import deprecate, logging
 from ..utils.torch_utils import maybe_allow_in_graph

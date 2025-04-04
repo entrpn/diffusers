@@ -1109,7 +1109,7 @@ class StableDiffusionXLPipeline(
 
         # 4. Prepare timesteps
         timesteps, num_inference_steps = retrieve_timesteps(
-            self.scheduler, num_inference_steps, device, timesteps, sigmas
+            self.scheduler, num_inference_steps, 'cpu', timesteps, sigmas
         )
 
         # 5. Prepare latent variables
@@ -1209,8 +1209,9 @@ class StableDiffusionXLPipeline(
 
                 latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
 
+                prompt_embeds = prompt_embeds.to(dtype=torch.bfloat16)
                 # predict the noise residual
-                added_cond_kwargs = {"text_embeds": add_text_embeds, "time_ids": add_time_ids}
+                added_cond_kwargs = {"text_embeds": add_text_embeds.to(dtype=torch.bfloat16), "time_ids": add_time_ids.to(dtype=torch.bfloat16)}
                 if ip_adapter_image is not None or ip_adapter_image_embeds is not None:
                     added_cond_kwargs["image_embeds"] = image_embeds
                 noise_pred = self.unet(
@@ -1295,7 +1296,8 @@ class StableDiffusionXLPipeline(
                 self.vae.to(dtype=torch.float16)
         else:
             image = latents
-
+        xm.mark_step()
+        image = image.to('cpu')
         if not output_type == "latent":
             # apply watermark if available
             if self.watermark is not None:

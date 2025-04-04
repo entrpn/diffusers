@@ -14,11 +14,9 @@
 import inspect
 import math
 from typing import Callable, List, Optional, Tuple, Union
-import functools
 import torch
 import torch.nn.functional as F
 from torch import nn
-import torch_xla.debug.profiler as xp
 from ..image_processor import IPAdapterMaskProcessor
 from ..utils import deprecate, is_torch_xla_available, logging
 from ..utils.import_utils import is_torch_npu_available, is_torch_xla_version, is_xformers_available
@@ -3239,6 +3237,24 @@ class AttnProcessorNPU:
 
         return hidden_states
 
+def scaled_dot_product_attention(q, k, v):
+    """
+    Compute the attention weights and output using scaled dot-product attention.
+
+    Args:
+        q (`torch.Tensor`):
+            Query tensor of shape (batch_size, num_heads, seq_length, head_dim).
+        k (`torch.Tensor`):
+            Key tensor of shape (batch_size, num_heads, seq_length, head_dim).
+        v (`torch.Tensor`):
+            Value tensor of shape (batch_size, num_heads, seq_length, head_dim).
+
+    Returns:
+        `torch.Tensor`: The output tensor after applying attention.
+    """
+    attn_weights = torch.matmul(q, k.transpose(-2, -1)) / math.sqrt(q.size(-1))
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    return torch.matmul(attn_weights, v)
 
 class AttnProcessor2_0:
     r"""
@@ -3268,7 +3284,6 @@ class AttnProcessor2_0:
             hidden_states = attn.spatial_norm(hidden_states, temb)
 
         input_ndim = hidden_states.ndim
-
         if input_ndim == 4:
             batch_size, channel, height, width = hidden_states.shape
             hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
@@ -3311,8 +3326,8 @@ class AttnProcessor2_0:
 
         # the output of sdp = (batch, num_heads, seq_len, head_dim)
         # TODO: add support for attn.scale when we move to Torch 2.1
-        hidden_states = F.scaled_dot_product_attention(
-            query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False
+        hidden_states = scaled_dot_product_attention(
+            query, key, value
         )
 
         hidden_states = hidden_states.transpose(1, 2).reshape(batch_size, -1, attn.heads * head_dim)
@@ -3464,6 +3479,10 @@ class XLADotAttnProcessor:
         *args,
         **kwargs,
     ) -> torch.Tensor:
+        input_ndim = hidden_states.ndim
+        if input_ndim == 4:
+            batch_size, channel, height, width = hidden_states.shape
+            hidden_states = hidden_states.view(batch_size, channel, height * width).transpose(1, 2)
         if encoder_hidden_states is None:
             encoder_hidden_states = hidden_states
         hidden_states = CrossAttention.apply(hidden_states, encoder_hidden_states, attn.to_q.weight, attn.to_k.weight, attn.to_v.weight, attn.heads)

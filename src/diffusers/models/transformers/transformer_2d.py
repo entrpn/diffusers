@@ -24,7 +24,6 @@ from ..embeddings import ImagePositionalEmbeddings, PatchEmbed, PixArtAlphaTextP
 from ..modeling_outputs import Transformer2DModelOutput
 from ..modeling_utils import LegacyModelMixin
 from ..normalization import AdaLayerNormSingle
-import torch_xla.debug.profiler as xp
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
@@ -321,7 +320,6 @@ class Transformer2DModel(LegacyModelMixin, LegacyConfigMixin):
                 in_features=self.caption_channels, hidden_size=self.inner_dim
             )
 
-    @xp.trace_me("Transformer2Dmodel")
     def forward(
         self,
         hidden_states: torch.Tensor,
