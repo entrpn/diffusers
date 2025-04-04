@@ -22,7 +22,6 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from transformers import CLIPTextModel, CLIPTextModelWithProjection, AutoTokenizer
 from transformers.trainer_pt_utils import get_module_class_from_name
-# from viztracer import VizTracer
 
 from torch._dispatch.python import suspend_functionalization
 from torch._subclasses.functional_tensor import disable_functional_mode
@@ -172,7 +171,6 @@ class TrainSD:
         self.mesh = xs.get_global_mesh()
         self.dataloader = iter(dataloader)
         self.global_step = 0
-        # self.step_fn_compiled = torch.compile(self.step_fn, backend="openxla")
 
     def run_optimizer(self):
         self.optimizer.step()
@@ -206,7 +204,7 @@ class TrainSD:
             def print_loss_closure(step, loss):
                 print(f"Step: {step}, Loss: {loss}")
 
-            if True:
+            if self.args.print_loss:
                 xm.add_step_closure(
                     print_loss_closure,
                     args=(
