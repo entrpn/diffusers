@@ -9,12 +9,13 @@ from diffusers import StableDiffusionXLPipeline
 import torch_xla.runtime as xr
 
 CACHE_DIR = os.environ.get("CACHE_DIR", '/mnt/bbahl/xla_cache/')
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", '/mnt/bbahl/trained-model/')
 if CACHE_DIR:
     xr.initialize_cache(CACHE_DIR, readonly=False)
 
 
 device = xm.xla_device()
-model_path = "/mnt/bbahl/trained-model"
+model_path = OUTPUT_DIR
 pipe = StableDiffusionXLPipeline.from_pretrained(
     model_path, 
     torch_dtype=torch.bfloat16
