@@ -27,7 +27,6 @@ pipe.unet.enable_xla_attention()
 # pipe.vae.enable_xla_attention()
 start = time()
 print("compiling...")
-import pdb; pdb.set_trace()
 image = pipe(prompt, num_inference_steps=30, guidance_scale=7.5).images[0]
 print(f"compile time: {time() - start}")
 print("generate...")

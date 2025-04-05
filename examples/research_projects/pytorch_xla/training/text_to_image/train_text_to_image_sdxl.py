@@ -182,13 +182,14 @@ class TrainSD:
         print("max_train_steps: ", self.args.max_train_steps)
         assert measure_start_step < self.args.max_train_steps
         total_time = 0
-        last_time = time.time()
+        last_time = None
         for step in range(0, self.args.max_train_steps):
             print("step: ", step)
             start_time = time.time()
             batch = next(self.dataloader)
             print(f"dataloading time {time.time()-start_time}")
             if step == measure_start_step and PROFILE_DIR is not None:
+                last_time = time.time()
                 xm.wait_device_ops()
                 xp.trace_detached(f"localhost:{PORT}", PROFILE_DIR, duration_ms=args.profile_duration)
             
@@ -215,8 +216,9 @@ class TrainSD:
         xm.mark_step()
         if not dataloader_exception:
             xm.wait_device_ops()
-            total_time = time.time() - last_time
-            print(f"Average step time: {total_time/(self.args.max_train_steps-measure_start_step)}")
+            if last_time is not None:
+                total_time = time.time() - last_time
+                print(f"Average step time: {total_time/(self.args.max_train_steps-measure_start_step)}")
         else:
             print("dataloader exception happen, skip result")
             return
@@ -486,6 +488,14 @@ def parse_args():
         default=False,
         action="store_true",
         help=("Print loss at every step."),
+    )
+    parser.add_argument(
+        "--xla_gradient_checkpointing",
+        default=False,
+        action="store_true",
+        help=("Enable gradient checkpointing to save memory at the expense of slower backward pass."
+              "This saves the inputs to the BasicTransformerBlock and recomputes the forward pass during the backward pass."
+        )
     )
 
     args = parser.parse_args()
@@ -813,7 +823,9 @@ def main(args):
         )
         print(f"  Total optimization steps = {args.max_train_steps}")
     
-    # unet = add_checkpoints(unet)
+    if args.xla_gradient_checkpointing:
+        unet = add_checkpoints(unet)
+
     trainer = TrainSD(
         weight_dtype=weight_dtype,
         device=device,
